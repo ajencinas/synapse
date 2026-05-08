@@ -1,0 +1,93 @@
+# Secrets / credentials
+.env
+.env.*
+rclone.conf
+service_account*.json
+credentials.json
+*.pem
+*.key
+*.p12
+
+# Python venv
+synapse/
+venv/
+.venv/
+
+# Tooling / editors / OS
+.claude/
+.qoder/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Excluded from this repo
+AGENTS.md
+common_pretrain_text_processing/
+download_pretrain_books/
+download_pretrain_others/
+
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+build/
+dist/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+
+# Logs
+*.log
+
+# Data / model artifacts (tokenizer shards, training checkpoints)
+*.bin
+*.npy
+*.npz
+*.parquet
+*.arrow
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.shard
+*.tokens
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.gz
+
+# Run / output directories
+shards/
+merged/
+tokens/
+out/
+outputs/
+checkpoints/
+runs/
+wandb/
+lightning_logs/
+
+# HuggingFace / datasets caches
+.huggingface/
+hf_cache/
+datasets_cache/
+
+# Coverage
+.coverage
+htmlcov/
+coverage.xml
+
+# Editor swap files
+*.swp
+*.swo
+*~
