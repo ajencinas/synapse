@@ -131,7 +131,6 @@ NUM_LAYERS      = 28
 NUM_HEADS       = 20            # head_dim = 128
 NUM_KV_HEADS    = 4             # GQA, group size = 5
 FF_HIDDEN_DIM   = 6912          # ~8/3 * EMBED_DIM, multiple of 128
-DROPOUT         = 0.1
 ROPE_BASE       = 10000.0
 RMSNORM_EPS     = 1e-5
 GRAD_CHECKPOINT = True
@@ -214,7 +213,7 @@ def apply_rope(x, cos, sin):
     return (x * cos) + (rotated * sin)
 
 class CausalGQA(nn.Module):
-    def __init__(self, embed_dim, num_heads, num_kv_heads, dropout):
+    def __init__(self, embed_dim, num_heads, num_kv_heads):
         super().__init__()
         assert embed_dim % num_heads == 0
         assert num_heads % num_kv_heads == 0
@@ -227,7 +226,6 @@ class CausalGQA(nn.Module):
         self.k_proj = nn.Linear(embed_dim, kv_dim, bias=False)
         self.v_proj = nn.Linear(embed_dim, kv_dim, bias=False)
         self.o_proj = nn.Linear(embed_dim, embed_dim, bias=False)
-        self.dropout = dropout
     def forward(self, x, cos, sin):
         B, T, C = x.size()
         q = self.q_proj(x).view(B, T, self.num_heads,    self.head_dim).transpose(1, 2)
@@ -238,11 +236,7 @@ class CausalGQA(nn.Module):
         if self.n_rep > 1:
             k = k.repeat_interleave(self.n_rep, dim=1)
             v = v.repeat_interleave(self.n_rep, dim=1)
-        y = F.scaled_dot_product_attention(
-            q, k, v,
-            is_causal=True,
-            dropout_p=self.dropout if self.training else 0.0,
-        )
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.o_proj(y)
 
@@ -256,16 +250,15 @@ class SwiGLU(nn.Module):
         return self.w2(F.silu(x1) * x2)
 
 class TransformerBlock(nn.Module):
-    def __init__(self, embed_dim, num_heads, num_kv_heads, ff_hidden_dim, dropout, rms_eps):
+    def __init__(self, embed_dim, num_heads, num_kv_heads, ff_hidden_dim, rms_eps):
         super().__init__()
         self.norm1 = RMSNorm(embed_dim, eps=rms_eps)
-        self.attn  = CausalGQA(embed_dim, num_heads, num_kv_heads, dropout)
+        self.attn  = CausalGQA(embed_dim, num_heads, num_kv_heads)
         self.norm2 = RMSNorm(embed_dim, eps=rms_eps)
         self.ff    = SwiGLU(embed_dim, ff_hidden_dim)
-        self.dropout = dropout
     def forward(self, x, cos, sin):
-        x = x + F.dropout(self.attn(self.norm1(x), cos, sin), p=self.dropout, training=self.training)
-        x = x + F.dropout(self.ff(self.norm2(x)),             p=self.dropout, training=self.training)
+        x = x + self.attn(self.norm1(x), cos, sin)
+        x = x + self.ff(self.norm2(x))
         return x
 
 class SynapseGPT(nn.Module):
@@ -273,7 +266,7 @@ class SynapseGPT(nn.Module):
         super().__init__()
         self.token_embedding = nn.Embedding(vocab_size, EMBED_DIM)
         self.blocks = nn.ModuleList([
-            TransformerBlock(EMBED_DIM, NUM_HEADS, NUM_KV_HEADS, FF_HIDDEN_DIM, DROPOUT, RMSNORM_EPS)
+            TransformerBlock(EMBED_DIM, NUM_HEADS, NUM_KV_HEADS, FF_HIDDEN_DIM, RMSNORM_EPS)
             for _ in range(NUM_LAYERS)
         ])
         self.final_norm = RMSNorm(EMBED_DIM, eps=RMSNORM_EPS)
@@ -656,7 +649,7 @@ manifest = {
         "block_size": BLOCK_SIZE, "stride": STRIDE,
         "embed_dim": EMBED_DIM, "num_layers": NUM_LAYERS,
         "num_heads": NUM_HEADS, "num_kv_heads": NUM_KV_HEADS,
-        "ff_hidden_dim": FF_HIDDEN_DIM, "dropout": DROPOUT,
+        "ff_hidden_dim": FF_HIDDEN_DIM,
         "rope_base": ROPE_BASE, "rmsnorm_eps": RMSNORM_EPS,
         "gradient_checkpointing": GRAD_CHECKPOINT,
         "vocab_size_raw": VOCAB_SIZE_RAW, "vocab_size_padded": VOCAB_SIZE,
