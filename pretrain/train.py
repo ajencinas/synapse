@@ -168,7 +168,7 @@ EVAL_BATCHES             = 32
 EVAL_SEED                = 1337
 
 # -- MID-EPOCH CHECKPOINT --
-SAVE_EVERY_N_SHARDS = 50
+SAVE_EVERY_N_SHARDS = 5
 
 # Hardware Settings
 torch.set_float32_matmul_precision('high')
