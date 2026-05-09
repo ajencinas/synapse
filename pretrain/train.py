@@ -625,6 +625,17 @@ for epoch in range(1, EPOCHS + 1):
         shard_name = shard_info["shard"]
         shard_source = get_source_name(shard_info)
 
+        # Surface the source .txt files inside this merged shard so loss
+        # spikes/dips are interpretable from scrollback.
+        sources = shard_info.get("merged_from", [])
+        if sources:
+            names = [os.path.basename(s["source"]) for s in sources]
+            head = ", ".join(names[:5])
+            suffix = f", ...and {len(names)-5} more" if len(names) > 5 else ""
+            print(f"\nEp {epoch} [{shard_idx+1}/{len(epoch_shards)}] "
+                  f"{shard_source}/{shard_name} - {len(names)} sources:\n"
+                  f"    {head}{suffix}")
+
         tokens = np.fromfile(shard_path, dtype=SHARD_DTYPE).astype(np.int64)
         dataset = ShardDataset(tokens, BLOCK_SIZE, STRIDE)
         if len(dataset) == 0:
