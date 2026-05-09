@@ -2,12 +2,15 @@
 """SynapseGPT pretraining — runs in Colab or on a bare VM (Lambda, GCP, etc.).
 
 Configurable via environment variables (all optional):
-  SYNAPSE_DIR        Base dir holding token_shards_merged/, checkpoints/, manifests/.
-                     Default: /content/drive/MyDrive/synapse on Colab, ./synapse elsewhere.
-  CHECKPOINT_NAME    Checkpoint filename. Default: synapse_2b_d2560_l28.pth.
-  MAX_TOKENS         Token budget. Default: 42_000_000_000.
-  EXPECTED_TOK_ID    Required tokenization_id. Default: 7a570a7ba9fc7985.
-  SKIP_DRIVE_MOUNT   If "1", don't try to mount Google Drive even on Colab.
+  SYNAPSE_DIR             Base dir holding token_shards_merged/, checkpoints/, manifests/.
+                          Default: /content/drive/MyDrive/synapse on Colab, ./synapse elsewhere.
+  CHECKPOINT_NAME         Checkpoint filename. Default: synapse_2b_d2560_l28.pth.
+  MAX_TOKENS              Token budget. Default: 42_000_000_000.
+  EXPECTED_TOK_ID         Required tokenization_id. Default: 7a570a7ba9fc7985.
+  SKIP_DRIVE_MOUNT        If "1", don't try to mount Google Drive even on Colab.
+  CHECKPOINT_PUSH_REMOTE  Optional rclone remote dir, e.g. "gdrive:synapse/checkpoints".
+                          If set, every checkpoint save is pushed there in a background
+                          thread (used on Lambda/RunPod where local SSD is ephemeral).
 """
 import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -20,6 +23,8 @@ import time
 import shutil
 import datetime
 import logging
+import subprocess
+import threading
 from collections import defaultdict
 
 import numpy as np
@@ -91,6 +96,29 @@ def filter_present_shards(shards, shard_dir, dtype_bytes):
             continue
         kept.append(s)
     return kept, missing, wrong_size
+
+def _push_to_remote_async(local_path, remote_dir):
+    # Fire-and-forget rclone copy. Used on VMs where the trainer writes to
+    # local SSD but we need durable copies on Drive in case the box dies.
+    # Failures are logged but don't crash training - the next save retries.
+    if not remote_dir:
+        return
+    remote_path = remote_dir.rstrip("/") + "/" + os.path.basename(local_path)
+    def _run():
+        try:
+            r = subprocess.run(
+                ["rclone", "copyto", local_path, remote_path,
+                 "--checksum", "--drive-chunk-size=64M"],
+                capture_output=True, text=True, timeout=3600,
+            )
+            if r.returncode == 0:
+                print(f"  pushed {os.path.basename(local_path)} -> {remote_dir}")
+            else:
+                print(f"  WARNING: rclone push failed for "
+                      f"{os.path.basename(local_path)}: {r.stderr.strip()[:200]}")
+        except Exception as e:
+            print(f"  WARNING: rclone push exception: {e}")
+    threading.Thread(target=_run, daemon=True).start()
 
 
 # ==================== 3. CONFIGURATION ====================
@@ -691,15 +719,18 @@ for epoch in range(1, EPOCHS + 1):
             print(f"  Mid-epoch save at shard {shard_idx+1}/{len(epoch_shards)} "
                   f"(step {curr_step}, loss {final_loss:.3f}, {elapsed/3600:.1f}h elapsed)...")
             torch.save(model.state_dict(), CHECKPOINT_PATH)
+            _push_to_remote_async(CHECKPOINT_PATH, os.environ.get("CHECKPOINT_PUSH_REMOTE"))
 
     print(f"Saving Epoch {epoch}...")
     torch.save(model.state_dict(), CHECKPOINT_PATH)
+    _push_to_remote_async(CHECKPOINT_PATH, os.environ.get("CHECKPOINT_PUSH_REMOTE"))
 
 
 # ==================== 11. FINALIZE ====================
 total_time = time.time() - train_start
 print(f"Training Complete. {total_time/3600:.1f} hours, {curr_step} steps.")
 torch.save(model.state_dict(), CHECKPOINT_PATH)
+_push_to_remote_async(CHECKPOINT_PATH, os.environ.get("CHECKPOINT_PUSH_REMOTE"))
 
 
 # ==================== 12. SAVE MANIFEST ====================
@@ -749,6 +780,14 @@ manifest_path = os.path.join(MANIFEST_DIR, "training_latest.json")
 with open(manifest_path, "w") as f:
     json.dump(manifest, f, indent=2)
 print(f"Manifest saved: {manifest_path}")
+
+# Mirror the manifest to the same Drive root the checkpoint goes to.
+# Convention: if CHECKPOINT_PUSH_REMOTE ends in "/checkpoints", push the
+# manifest to the sibling "/manifests" dir.
+_ckpt_remote = os.environ.get("CHECKPOINT_PUSH_REMOTE", "")
+if _ckpt_remote.rstrip("/").endswith("/checkpoints"):
+    _manifest_remote = _ckpt_remote.rstrip("/")[: -len("/checkpoints")] + "/manifests"
+    _push_to_remote_async(manifest_path, _manifest_remote)
 print(f"  tokenization_id: {current_tok_id}")
 print(f"  final_loss: {final_loss}")
 print(f"  final_eval_loss: {last_eval_loss}")

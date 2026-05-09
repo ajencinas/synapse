@@ -106,10 +106,65 @@ Each notebook is meant to be run standalone — they typically download into a p
 
 ### `pretrain/`
 
-- `pre_train_mar23.ipynb` — pretraining notebook that consumes the tokenized shards produced by `tokenize/`
+- `train.py` — standalone training script. Reads tokenized shards from `$SYNAPSE_DIR/token_shards_merged/`, writes checkpoints to `$SYNAPSE_DIR/checkpoints/`. Configurable via env vars (see top of file).
+- `pre_train_mar23.ipynb` — Colab notebook shim that mounts Drive, downloads `train.py` from this repo, and runs it.
+- `run_on_vm.sh` — bash bootstrap for running training on a bare GPU VM (Lambda Labs, RunPod, etc.). See *Running pretraining* below.
+- `inspect_shards.ipynb` — utility for tracing which `.txt` source files are inside any given merged shard.
+- `recover_from_tar.py` — extract missing merged shards from the cold-backup tar on Drive (used if `token_shards_merged/` gets corrupted).
+
+## Running pretraining
+
+Two supported paths. Pick one.
+
+### A) Google Colab (Pro / Pro+)
+
+1. Open `pretrain/pre_train_mar23.ipynb` in Colab.
+2. Connect to a GPU runtime (A100 or "G4" / RTX PRO 6000 Blackwell recommended).
+3. Run all cells. The notebook mounts Drive, downloads the latest `train.py` from this repo, stages selected shards to `/content/shards`, and trains.
+4. Checkpoints save to `gdrive:synapse/checkpoints/` via the Drive mount. Run resumes automatically across Colab sessions (just re-run the notebook).
+
+Knobs (warmup, learning rate, batch size, checkpoint cadence) all live near the top of `pretrain/train.py`.
+
+### B) Lambda Labs / RunPod (or any bare GPU VM)
+
+One-time setup on a fresh box:
+
+```bash
+git clone https://github.com/ajencinas/synapse.git
+cd synapse
+pip install -r requirements.txt
+pip install torch numpy tqdm                       # training deps
+curl https://rclone.org/install.sh | sudo bash     # if rclone not present
+rclone config                                       # set up "gdrive" remote
+```
+
+To start (or resume) training:
+
+```bash
+bash pretrain/run_on_vm.sh
+```
+
+What the script does:
+- Pulls shards from `gdrive:synapse/token_shards_merged/` to local SSD (one-time, ~30 min for 300 GB at typical VM bandwidth).
+- Pulls the latest checkpoint and manifest from Drive if they exist (resume).
+- Sets `SYNAPSE_DIR`, `SKIP_STAGE=1`, `CHECKPOINT_PUSH_REMOTE=gdrive:synapse/checkpoints`.
+- Execs `python pretrain/train.py`.
+
+Each mid-epoch save (every 2 shards by default) is pushed back to Drive in a background thread via `rclone`, so you can destroy the VM at any time and resume on a new one.
+
+Override knobs (set as env vars before running the script):
+
+| Env var | Default | What it does |
+|---|---|---|
+| `LOCAL_DIR` | auto: `/home/ubuntu/synapse_data` (Lambda) or `/workspace/synapse_data` (RunPod) | Where shards land locally. |
+| `GDRIVE_REMOTE` | `gdrive` | Your rclone remote name. |
+| `GDRIVE_PATH` | `synapse` | Base path on Drive. |
+| `MAX_TOKENS` | (train.py default: 42 B) | Token budget. Set lower for smoke tests. |
+| `CHECKPOINT_NAME` | (train.py default) | Checkpoint filename. |
+| `SKIP_DATA_PULL` | unset | If `1`, skip the rclone shard copy (assume data is already local). |
 
 ## Notes
 
 - No test framework, linter, or formatter is configured.
-- The included notebooks assume Google Colab + Google Drive for storage.
+- The Colab notebook assumes Drive; the VM path uses rclone-pushed Drive sync — both share the same `gdrive:synapse/...` layout.
 - If you need the private pipelines (`download_pretrain_books`, `download_pretrain_others`, `common_pretrain_text_processing`), reach out to the author.
