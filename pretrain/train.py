@@ -136,8 +136,8 @@ RMSNORM_EPS     = 1e-5
 GRAD_CHECKPOINT = False         # 95 GB Blackwell has VRAM headroom; recompute is wasted work
 
 # -- TRAINING HYPERPARAMETERS --
-BATCH_SIZE       = 8
-GRAD_ACCUM_STEPS = 32           # effective batch = 256 sequences = 524K tokens/step
+BATCH_SIZE       = 4
+GRAD_ACCUM_STEPS = 64           # effective batch = 256 sequences = 524K tokens/step
 EPOCHS           = 1
 MAX_LR           = 3e-4
 MIN_LR           = 3e-5
