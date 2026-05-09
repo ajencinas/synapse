@@ -506,6 +506,45 @@ for src, info in sorted(selected_by_source.items()):
 print(f"\n  TOTAL: {len(selected_shards)} shards, {selected_tokens:,} tokens")
 
 
+# ==================== 7b. STAGE SHARDS TO LOCAL DISK ====================
+# Drive FUSE reads at training time are 5-50 MB/s with random stalls. Copy
+# selected + eval shards to local SSD once; train from local for the run.
+# Override: STAGE_DIR=<path> or SKIP_STAGE=1.
+def _stage_shards_locally(src_dir, selected, evals):
+    if os.environ.get("SKIP_STAGE") == "1":
+        return src_dir
+    stage_dir = os.environ.get("STAGE_DIR") or ("/content/shards" if in_colab() else "")
+    if not stage_dir or os.path.abspath(stage_dir) == os.path.abspath(src_dir):
+        return src_dir
+    os.makedirs(stage_dir, exist_ok=True)
+    for fname in ("shard_manifest.json", "meta.json", "tokenization_id.txt"):
+        s = os.path.join(src_dir, fname)
+        d = os.path.join(stage_dir, fname)
+        if os.path.exists(s) and (not os.path.exists(d) or os.path.getsize(s) != os.path.getsize(d)):
+            shutil.copy2(s, d)
+    to_copy = sorted({s["shard"] for s in selected} | {s["shard"] for s in evals})
+    print(f"\nStaging {len(to_copy)} shards: {src_dir} -> {stage_dir}")
+    t0 = time.time()
+    total = 0
+    for i, name in enumerate(to_copy, 1):
+        s = os.path.join(src_dir, name)
+        d = os.path.join(stage_dir, name)
+        s_size = os.path.getsize(s)
+        if not (os.path.exists(d) and os.path.getsize(d) == s_size):
+            shutil.copy2(s, d)
+            if os.path.getsize(d) != s_size:
+                raise RuntimeError(f"staged size mismatch for {name}")
+        total += s_size
+        if i % 10 == 0 or i == len(to_copy):
+            elapsed = max(time.time() - t0, 0.01)
+            print(f"  {i}/{len(to_copy)} | {total/1024**3:.2f} GB | "
+                  f"{(total/1024**2)/elapsed:.0f} MB/s")
+    print(f"Staging done in {time.time()-t0:.0f}s.")
+    return stage_dir
+
+SHARD_DIR = _stage_shards_locally(SHARD_DIR, selected_shards, eval_shards)
+
+
 # ==================== 8. COMPUTE TOTAL STEPS ====================
 samples_approx = selected_tokens // BLOCK_SIZE
 batches_total = samples_approx // BATCH_SIZE
