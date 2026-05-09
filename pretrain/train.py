@@ -77,6 +77,21 @@ def file_info(path):
         "sha256": file_hash(path),
     }
 
+def filter_present_shards(shards, shard_dir, dtype_bytes):
+    # Drop manifest entries whose .bin is absent or wrong-size; lets training
+    # start while rclone is still mid-upload. Wrong-size catches partial files.
+    kept, missing, wrong_size = [], [], []
+    for s in shards:
+        path = os.path.join(shard_dir, s["shard"])
+        if not os.path.exists(path):
+            missing.append(s)
+            continue
+        if os.path.getsize(path) != s["tokens"] * dtype_bytes:
+            wrong_size.append(s)
+            continue
+        kept.append(s)
+    return kept, missing, wrong_size
+
 
 # ==================== 3. CONFIGURATION ====================
 maybe_mount_drive()
@@ -389,8 +404,6 @@ print(f"  decay groups: {sum(p.numel() for p in decay_params)/1e6:.1f}M params, 
 with open(os.path.join(SHARD_DIR, "shard_manifest.json"), "r") as f:
     shard_manifest = json.load(f)
 
-all_shards = shard_manifest["shards"]
-
 def get_source_name(shard_entry):
     source = shard_entry.get("source", "")
     parts = source.replace("\\", "/").split("/")
@@ -398,6 +411,33 @@ def get_source_name(shard_entry):
         if p.startswith("data_"):
             return p
     return "other"
+
+all_shards_raw = shard_manifest["shards"]
+all_shards, missing_shards, wrong_size_shards = filter_present_shards(
+    all_shards_raw, SHARD_DIR, SHARD_DTYPE.itemsize
+)
+n_skipped = len(missing_shards) + len(wrong_size_shards)
+if n_skipped:
+    print(f"\nFiltering manifest against {SHARD_DIR}:")
+    print(f"  kept {len(all_shards)}/{len(all_shards_raw)} "
+          f"({len(missing_shards)} missing, {len(wrong_size_shards)} wrong-size)")
+    skipped_by_source = defaultdict(lambda: {"missing": 0, "wrong_size": 0})
+    for s in missing_shards:
+        skipped_by_source[get_source_name(s)]["missing"] += 1
+    for s in wrong_size_shards:
+        skipped_by_source[get_source_name(s)]["wrong_size"] += 1
+    for src, counts in sorted(skipped_by_source.items()):
+        bits = []
+        if counts["missing"]:
+            bits.append(f"{counts['missing']} missing")
+        if counts["wrong_size"]:
+            bits.append(f"{counts['wrong_size']} wrong-size")
+        print(f"    {src}: {', '.join(bits)}")
+if not all_shards:
+    raise FileNotFoundError(
+        f"No usable shards in {SHARD_DIR}: all {len(all_shards_raw)} "
+        f"manifest entries are missing or wrong-size on disk."
+    )
 
 shards_by_source = defaultdict(list)
 for s in all_shards:
