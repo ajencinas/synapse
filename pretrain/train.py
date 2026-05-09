@@ -139,10 +139,10 @@ GRAD_CHECKPOINT = True
 BATCH_SIZE       = 4
 GRAD_ACCUM_STEPS = 64           # effective batch = 256 sequences = 524K tokens/step
 EPOCHS           = 1
-MAX_LR           = 2e-4
-MIN_LR           = 2e-5
+MAX_LR           = 3e-4
+MIN_LR           = 3e-5
 WEIGHT_DECAY     = 0.1
-WARMUP_STEPS     = 4000
+WARMUP_STEPS     = 1000
 BETAS            = (0.9, 0.95)
 GRAD_CLIP        = 1.0
 
