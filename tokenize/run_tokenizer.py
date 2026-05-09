@@ -4,8 +4,8 @@ Standalone tokenizer pipeline — runs on local SSD or any fast filesystem.
 Mirrors the logic of tokenizer_pipeline.ipynb without Colab/Drive dependencies.
 
 Usage:
-  python run_tokenizer.py                    # train new tokenizer + tokenize all
-  python run_tokenizer.py --no-train         # load existing tokenizer, tokenize new/changed only
+  python run_tokenizer.py                    # load existing tokenizer, tokenize new/changed only
+  python run_tokenizer.py --train            # train new tokenizer + tokenize all
   python run_tokenizer.py --config path      # use custom config path
 
 Paths (configured via env vars or defaults below):
@@ -274,7 +274,7 @@ def _tokenize_one(item):
 
 # ---------- Args ----------
 parser = argparse.ArgumentParser(description="Run the synapse tokenizer pipeline")
-parser.add_argument("--no-train", action="store_true", help="Skip training, load existing tokenizer")
+parser.add_argument("--train", action="store_true", help="Train a new tokenizer (default: load existing)")
 parser.add_argument("--workers", type=int, default=min(8, os.cpu_count() or 4),
                     help="Parallel worker processes for step 3 tokenization (1 = serial)")
 parser.add_argument("--no-merge", action="store_true",
@@ -314,7 +314,7 @@ print(f"\nTotal: {len(all_source_files)} source files, {total_size / 1024 / 1024
 print(f"  Train pool: {len(train_files)} files | Eval pool: {len(eval_files)} files\n")
 
 # ================= STEP 1: TRAIN OR LOAD TOKENIZER =================
-if not args.no_train:
+if args.train:
     subset_path = os.path.join(TOKENIZER_DIR, "bpe_subset.txt")
     print(f"[1/3] Building training sample ({TRAIN_SIZE_BYTES / 1024 / 1024 / 1024:.1f} GB) from {len(train_files)} train files...")
     train_by_dir = group_by_dir(train_files)
