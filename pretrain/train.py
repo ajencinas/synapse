@@ -376,6 +376,16 @@ if os.path.exists(CHECKPOINT_PATH):
 else:
     print(f"No checkpoint found — training from scratch.")
 
+# Cap Inductor fusion so RMSNorm forward+backward doesn't get merged into one
+# Triton kernel that needs >99 KB of shared memory (Blackwell's opt-in ceiling).
+import torch._inductor.config as _ic
+_ic.max_fusion_size = 16
+_ic.epilogue_fusion = False
+try:
+    _ic.triton.persistent_reductions = False
+except AttributeError:
+    pass  # older PyTorch — skip; the two above carry most of the fix
+
 print("Compiling model...")
 model = torch.compile(model)
 
