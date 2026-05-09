@@ -133,11 +133,11 @@ NUM_KV_HEADS    = 4             # GQA, group size = 5
 FF_HIDDEN_DIM   = 6912          # ~8/3 * EMBED_DIM, multiple of 128
 ROPE_BASE       = 10000.0
 RMSNORM_EPS     = 1e-5
-GRAD_CHECKPOINT = True
+GRAD_CHECKPOINT = False         # 95 GB Blackwell has VRAM headroom; recompute is wasted work
 
 # -- TRAINING HYPERPARAMETERS --
-BATCH_SIZE       = 4
-GRAD_ACCUM_STEPS = 64           # effective batch = 256 sequences = 524K tokens/step
+BATCH_SIZE       = 8
+GRAD_ACCUM_STEPS = 32           # effective batch = 256 sequences = 524K tokens/step
 EPOCHS           = 1
 MAX_LR           = 3e-4
 MIN_LR           = 3e-5
@@ -168,7 +168,7 @@ EVAL_BATCHES             = 32
 EVAL_SEED                = 1337
 
 # -- MID-EPOCH CHECKPOINT --
-SAVE_EVERY_N_SHARDS = 5
+SAVE_EVERY_N_SHARDS = 2
 
 # Hardware Settings
 torch.set_float32_matmul_precision('high')
