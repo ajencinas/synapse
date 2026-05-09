@@ -189,6 +189,10 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
+    # Graph-break here: Inductor was fusing RMSNorm fwd+bwd into one Triton
+    # kernel that wanted >160 KB of shared memory and couldn't compile.
+    # Running RMSNorm eager keeps the rest of the model compiled.
+    @torch._dynamo.disable
     def forward(self, x):
         in_dtype = x.dtype
         x = x.float()
