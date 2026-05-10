@@ -11,6 +11,13 @@ Configurable via environment variables (all optional):
   CHECKPOINT_PUSH_REMOTE  Optional rclone remote dir, e.g. "gdrive:synapse/checkpoints".
                           If set, every checkpoint save is pushed there in a background
                           thread (used on Lambda/RunPod where local SSD is ephemeral).
+
+Checkpoint schema (auto-detected on load):
+  v2 (dict):  {"schema":"v2", "model", "optimizer", "curr_step", "seen_shards", ...}
+  legacy:     a plain torch.nn.Module state_dict (model weights only).
+Loading legacy works fine; optimizer + step counter start fresh and shards
+already trained will appear in the next selection. Every save from here on
+writes v2, so subsequent restarts are fully clean.
 """
 import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -382,7 +389,15 @@ n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
 print(f"Model: {n_params/1e9:.3f}B params ({n_trainable/1e9:.3f}B trainable)")
 
 # --- CHECKPOINT LOADING ---
+# Two checkpoint formats are supported:
+#   v2 (dict): {"schema": "v2", "model", "optimizer", "curr_step", "seen_shards", ...}
+#   legacy (plain state_dict): just model weights, no optimizer/step/seen_shards.
+# Old-format .pths still load — optimizer starts cold and step counter starts
+# at 0 (one-time cost on first migration). Every subsequent save writes v2.
 resume_path = None
+_saved_optimizer_state = None
+_saved_curr_step = 0
+_saved_seen_shards = set()
 if os.path.exists(CHECKPOINT_PATH):
     train_manifest_path = os.path.join(MANIFEST_DIR, "training_latest.json")
     safe_to_load = True
@@ -399,7 +414,18 @@ if os.path.exists(CHECKPOINT_PATH):
     if safe_to_load:
         print(f"Resuming from: {CHECKPOINT_PATH}")
         resume_path = CHECKPOINT_PATH
-        state_dict = torch.load(CHECKPOINT_PATH, map_location=device)
+        ckpt_obj = torch.load(CHECKPOINT_PATH, map_location=device)
+        if isinstance(ckpt_obj, dict) and ckpt_obj.get("schema") == "v2":
+            state_dict = ckpt_obj["model"]
+            _saved_optimizer_state = ckpt_obj.get("optimizer")
+            _saved_curr_step = int(ckpt_obj.get("curr_step", 0))
+            _saved_seen_shards = set(ckpt_obj.get("seen_shards", []))
+            print(f"  v2 checkpoint: step={_saved_curr_step}, "
+                  f"seen_shards={len(_saved_seen_shards)}, "
+                  f"optimizer_state={'yes' if _saved_optimizer_state else 'no'}")
+        else:
+            state_dict = ckpt_obj
+            print(f"  legacy checkpoint (model-only); optimizer + step start fresh")
         new_state = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
         model_state = model.state_dict()
         safe_state = {k: v for k, v in new_state.items() if k in model_state and v.shape == model_state[k].shape}
@@ -433,6 +459,13 @@ optimizer = optim.AdamW(optim_groups, lr=MAX_LR, betas=BETAS, fused=True)
 print(f"Optimizer: AdamW(fused) lr={MAX_LR} betas={BETAS} wd={WEIGHT_DECAY}")
 print(f"  decay groups: {sum(p.numel() for p in decay_params)/1e6:.1f}M params, "
       f"nodecay: {sum(p.numel() for p in nodecay_params)/1e6:.3f}M params")
+
+if _saved_optimizer_state is not None:
+    try:
+        optimizer.load_state_dict(_saved_optimizer_state)
+        print("  restored optimizer state from checkpoint")
+    except Exception as e:
+        print(f"  WARNING: couldn't restore optimizer state ({e}); starting cold")
 
 
 # ==================== 7. SELECT SHARDS (TRAIN + EVAL SPLIT) ====================
@@ -578,6 +611,8 @@ SHARD_DIR = _stage_shards_locally(SHARD_DIR, selected_shards, eval_shards)
 
 
 # ==================== 8. COMPUTE TOTAL STEPS ====================
+# Anchor total_steps to the full selection BEFORE seen-shard filtering, so
+# the LR cosine schedule stays calibrated against the original training plan.
 samples_approx = selected_tokens // BLOCK_SIZE
 batches_total = samples_approx // BATCH_SIZE
 total_steps = (batches_total * EPOCHS) // GRAD_ACCUM_STEPS
@@ -586,6 +621,13 @@ print(f"  Effective Batch Size: {BATCH_SIZE * GRAD_ACCUM_STEPS} sequences "
       f"({BATCH_SIZE * GRAD_ACCUM_STEPS * BLOCK_SIZE:,} tokens/step)")
 print(f"  Total optimizer steps: {total_steps:,} | Warmup: {WARMUP_STEPS}")
 print(f"  Mid-epoch save every {SAVE_EVERY_N_SHARDS} shards | Eval every {EVAL_EVERY_STEPS} steps")
+
+# Drop shards that were already trained in a previous run (v2 checkpoint).
+if _saved_seen_shards:
+    before = len(selected_shards)
+    selected_shards = [s for s in selected_shards if s["shard"] not in _saved_seen_shards]
+    print(f"  Skipping {before - len(selected_shards)} already-trained shards from prior run "
+          f"({len(selected_shards)} remaining)")
 
 
 # ==================== 9. EVAL HELPER ====================
@@ -634,12 +676,27 @@ def get_lr(it, total_it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * min(1.0, decay_ratio)))
     return MIN_LR + coeff * (MAX_LR - MIN_LR)
 
-curr_step = 0
+curr_step = _saved_curr_step
+seen_shards = set(_saved_seen_shards)
 final_loss = None
 last_grad_norm = None
 last_eval_loss = None
 eval_history = []
 train_start = time.time()
+
+def _save_checkpoint():
+    # Bundle model + optimizer + step counter + seen-shards into one v2 file,
+    # so a future resume can fully restore (model load + warm Adam + same LR
+    # schedule position + skip already-trained shards).
+    torch.save({
+        "schema": "v2",
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "curr_step": curr_step,
+        "seen_shards": sorted(seen_shards),
+        "tokenization_id": current_tok_id,
+    }, CHECKPOINT_PATH)
+    _push_to_remote_async(CHECKPOINT_PATH, os.environ.get("CHECKPOINT_PUSH_REMOTE"))
 
 print("\nSTARTING TRAINING (BFloat16, GQA, RoPE, RMSNorm, grad-ckpt)\n")
 
@@ -713,24 +770,22 @@ for epoch in range(1, EPOCHS + 1):
                           f"(train={final_loss:.4f}, grad_norm={last_grad_norm:.2f})")
 
         del tokens, dataset, loader
+        seen_shards.add(shard_name)
 
         if (shard_idx + 1) % SAVE_EVERY_N_SHARDS == 0:
             elapsed = time.time() - train_start
             print(f"  Mid-epoch save at shard {shard_idx+1}/{len(epoch_shards)} "
                   f"(step {curr_step}, loss {final_loss:.3f}, {elapsed/3600:.1f}h elapsed)...")
-            torch.save(model.state_dict(), CHECKPOINT_PATH)
-            _push_to_remote_async(CHECKPOINT_PATH, os.environ.get("CHECKPOINT_PUSH_REMOTE"))
+            _save_checkpoint()
 
     print(f"Saving Epoch {epoch}...")
-    torch.save(model.state_dict(), CHECKPOINT_PATH)
-    _push_to_remote_async(CHECKPOINT_PATH, os.environ.get("CHECKPOINT_PUSH_REMOTE"))
+    _save_checkpoint()
 
 
 # ==================== 11. FINALIZE ====================
 total_time = time.time() - train_start
 print(f"Training Complete. {total_time/3600:.1f} hours, {curr_step} steps.")
-torch.save(model.state_dict(), CHECKPOINT_PATH)
-_push_to_remote_async(CHECKPOINT_PATH, os.environ.get("CHECKPOINT_PUSH_REMOTE"))
+_save_checkpoint()
 
 
 # ==================== 12. SAVE MANIFEST ====================
