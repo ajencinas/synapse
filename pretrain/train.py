@@ -197,10 +197,11 @@ DATA_MIX = {
 }
 
 # -- EVAL --
-EVAL_FRACTION_PER_SOURCE = 0.02
-EVAL_EVERY_STEPS         = 500
-EVAL_BATCHES             = 32
-EVAL_SEED                = 1337
+EVAL_FRACTION_PER_SOURCE   = 0.02
+MAX_EVAL_SHARDS_PER_SOURCE = 5     # cap so abundant sources (code, c4) don't dominate eval
+EVAL_EVERY_STEPS           = 500
+EVAL_BATCHES               = 32    # per source — total eval work ~= 32 * num_sources
+EVAL_SEED                  = 1337
 
 # -- MID-EPOCH CHECKPOINT --
 SAVE_EVERY_N_SHARDS = 2
@@ -523,6 +524,7 @@ for src, shards in shards_by_source.items():
     pool = shards.copy()
     eval_rng.shuffle(pool)
     n_eval = max(1, int(len(pool) * EVAL_FRACTION_PER_SOURCE)) if len(pool) > 1 else 0
+    n_eval = min(n_eval, MAX_EVAL_SHARDS_PER_SOURCE)
     eval_shards.extend(pool[:n_eval])
     train_pool_by_source[src] = pool[n_eval:]
 print(f"\nHeld out {len(eval_shards)} eval shards "
@@ -632,40 +634,48 @@ if _saved_seen_shards:
 
 # ==================== 9. EVAL HELPER ====================
 @torch.no_grad()
-def run_eval(model, eval_shards, n_batches):
+def run_eval(model, eval_shards, n_batches_per_source):
+    """Per-source eval. Returns {source: mean_loss, "overall": unweighted mean of sources}.
+    The unweighted "overall" lets a small source (e.g. wikipedia, 1 eval shard) move
+    the headline number as much as a large source (code, 5 shards) - so a code-heavy
+    eval pool no longer masks regressions on other domains."""
     model.eval()
-    losses = []
+    by_source = defaultdict(list)
+    by_src_pool = defaultdict(list)
+    for s in eval_shards:
+        by_src_pool[get_source_name(s)].append(s)
     rng = random.Random(EVAL_SEED)
-    pool = eval_shards.copy()
-    rng.shuffle(pool)
-    seen = 0
-    for shard_info in pool:
-        shard_path = os.path.join(SHARD_DIR, shard_info["shard"])
-        try:
-            tokens = np.fromfile(shard_path, dtype=SHARD_DTYPE).astype(np.int64)
-        except FileNotFoundError:
-            continue
-        ds = ShardDataset(tokens, BLOCK_SIZE, STRIDE)
-        if len(ds) == 0:
-            continue
-        loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
-        for xb, yb in loader:
-            xb = xb.to(device, non_blocking=True)
-            yb = yb.to(device, non_blocking=True)
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                logits = model(xb)
-                loss = F.cross_entropy(logits.view(-1, VOCAB_SIZE), yb.view(-1))
-            losses.append(loss.item())
-            seen += 1
-            if seen >= n_batches:
+    for src, pool in by_src_pool.items():
+        pool = pool.copy()
+        rng.shuffle(pool)
+        seen = 0
+        for shard_info in pool:
+            shard_path = os.path.join(SHARD_DIR, shard_info["shard"])
+            try:
+                tokens = np.fromfile(shard_path, dtype=SHARD_DTYPE).astype(np.int64)
+            except FileNotFoundError:
+                continue
+            ds = ShardDataset(tokens, BLOCK_SIZE, STRIDE)
+            if len(ds) == 0:
+                continue
+            loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+            for xb, yb in loader:
+                xb = xb.to(device, non_blocking=True)
+                yb = yb.to(device, non_blocking=True)
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    logits = model(xb)
+                    loss = F.cross_entropy(logits.view(-1, VOCAB_SIZE), yb.view(-1))
+                by_source[src].append(loss.item())
+                seen += 1
+                if seen >= n_batches_per_source:
+                    break
+            del tokens, ds, loader
+            if seen >= n_batches_per_source:
                 break
-        del tokens, ds, loader
-        if seen >= n_batches:
-            break
     model.train()
-    if not losses:
-        return float('nan')
-    return sum(losses) / len(losses)
+    result = {src: sum(losses) / len(losses) for src, losses in by_source.items() if losses}
+    result["overall"] = (sum(result.values()) / len(result)) if result else float('nan')
+    return result
 
 
 # ==================== 10. TRAINING LOOP ====================
@@ -763,11 +773,18 @@ for epoch in range(1, EPOCHS + 1):
                                  eval=("-" if last_eval_loss is None else f"{last_eval_loss:.3f}"))
 
                 if curr_step % EVAL_EVERY_STEPS == 0:
-                    last_eval_loss = run_eval(model, eval_shards, EVAL_BATCHES)
-                    eval_history.append({"step": curr_step, "loss": last_eval_loss,
-                                         "elapsed_hrs": round(elapsed/3600, 2)})
-                    print(f"  [eval @ step {curr_step}] loss={last_eval_loss:.4f} "
-                          f"(train={final_loss:.4f}, grad_norm={last_grad_norm:.2f})")
+                    eval_result = run_eval(model, eval_shards, EVAL_BATCHES)
+                    last_eval_loss = eval_result["overall"]
+                    eval_history.append({
+                        "step": curr_step,
+                        "loss": last_eval_loss,
+                        "by_source": {k: v for k, v in eval_result.items() if k != "overall"},
+                        "elapsed_hrs": round(elapsed / 3600, 2),
+                    })
+                    per_src = " ".join(f"{src.replace('data_', '')}={v:.2f}"
+                                       for src, v in sorted(eval_result.items()) if src != "overall")
+                    print(f"  [eval @ step {curr_step}] overall={last_eval_loss:.3f} | "
+                          f"{per_src} (train={final_loss:.3f}, gnorm={last_grad_norm:.2f})")
 
         del tokens, dataset, loader
         seen_shards.add(shard_name)
