@@ -501,21 +501,27 @@ new_count = skip_count = total_new_tokens = 0
 t0 = time.time()
 
 # ---------- Pre-flight: classify each source as skip vs work ----------
-# Cheap size-only skip happens here in main process; size-mismatch hash check
-# is deferred to workers so disk reads run in parallel.
+# shard_manifest.json is the source of truth. If the manifest has an entry for
+# this source with a matching size, skip it — regardless of whether the .bin is
+# physically on disk. This lets cold-tar backups (manifest on Drive, .bins
+# archived elsewhere) work without re-tokenizing. The tokenization_id mismatch
+# branch above has already wiped the manifest if the tokenizer changed, so any
+# entry we see here is guaranteed to be for the current tokenizer.
 work_items = []  # list of (src_path, shard_path, src_size, prior_hash, prior_existing_hash)
+cold_skip_count = 0  # subset of skip_count where the .bin is not on disk
 for src_path in all_source_files:
     src_size = os.path.getsize(src_path)
     prior_existing_hash = None
     if src_path in existing_shards:
         old_entry = existing_shards[src_path]
         shard_path_old = os.path.join(SHARD_DIR, old_entry["shard"])
-        if os.path.exists(shard_path_old):
-            if src_size == old_entry.get("source_size", -1):
-                skip_count += 1
-                continue
-            # Size differs — defer hash compare to worker.
-            prior_existing_hash = old_entry.get("source_hash")
+        if src_size == old_entry.get("source_size", -1):
+            skip_count += 1
+            if not os.path.exists(shard_path_old):
+                cold_skip_count += 1
+            continue
+        # Size differs — defer hash compare to worker.
+        prior_existing_hash = old_entry.get("source_hash")
         shard_name = old_entry["shard"]
     else:
         shard_name = f"shard_{shard_idx:05d}.bin"
@@ -523,7 +529,9 @@ for src_path in all_source_files:
     shard_path = os.path.join(SHARD_DIR, shard_name)
     work_items.append((src_path, shard_path, src_size, None, prior_existing_hash))
 
-print(f"  Pre-flight: {len(work_items)} to tokenize, {skip_count} skipped (size match)")
+print(f"  Pre-flight: {len(work_items)} to tokenize, {skip_count} skipped (manifest match)")
+if cold_skip_count:
+    print(f"              of {skip_count} skipped, {cold_skip_count} have no .bin on disk (cold)")
 print(f"  Workers: {args.workers}")
 
 def _apply_entry(entry):
@@ -642,6 +650,20 @@ print(f"  tokenization_id: {current_tok_id}")
 merge_cfg = config.get("merge", {})
 merge_enabled = merge_cfg.get("enabled", False) and not args.no_merge
 if merge_enabled:
+    # Fail loud before merge if any manifest entry has no .bin on disk —
+    # merge_shards.py would sys.exit on the first missing input, but doing the
+    # check up front gives a clearer message and a full count.
+    missing_bins = [
+        s for s in shard_manifest.get("shards", [])
+        if not os.path.exists(os.path.join(SHARD_DIR, s.get("shard", "")))
+    ]
+    if missing_bins:
+        examples = ", ".join(s["shard"] for s in missing_bins[:5])
+        raise RuntimeError(
+            f"{len(missing_bins)} shard(s) in the manifest have no .bin on disk "
+            f"(examples: {examples}). Restore the tar archives into {SHARD_DIR} "
+            f"or re-run with --no-merge."
+        )
     target_bytes = args.merge_target_bytes or merge_cfg.get("target_bytes", 100 * 1024 * 1024)
     merged_dir = SHARD_DIR.rstrip("/") + "_merged"
     print(f"\n[4/4] Merging shards -> {merged_dir} (target {target_bytes / 1024 / 1024:.0f} MB)")
