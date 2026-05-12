@@ -416,7 +416,15 @@ shard_manifest = {"tokenization_id": current_tok_id, "shards": []}
 if os.path.exists(SHARD_MANIFEST_PATH):
     with open(SHARD_MANIFEST_PATH, "r") as f:
         shard_manifest = json.load(f)
-existing_shards = {s["source"]: s for s in shard_manifest.get("shards", [])}
+
+def source_key(path):
+    """Mount-point-agnostic identity: (domain, filename). Lets the manifest be
+    portable across machines — moving DATA_PATH from /mnt/ssd to a Drive mount
+    doesn't invalidate skip lookups. Matches the (parent_dir, basename) pair
+    that merge_shards.py already uses for domain grouping."""
+    return (os.path.basename(os.path.dirname(path)), os.path.basename(path))
+
+existing_shards = {source_key(s["source"]): s for s in shard_manifest.get("shards", [])}
 
 # Validate manifest/disk consistency BEFORE assigning new shard names. Any
 # inconsistency (duplicates, orphans) means an earlier run produced bad state;
@@ -512,8 +520,9 @@ cold_skip_count = 0  # subset of skip_count where the .bin is not on disk
 for src_path in all_source_files:
     src_size = os.path.getsize(src_path)
     prior_existing_hash = None
-    if src_path in existing_shards:
-        old_entry = existing_shards[src_path]
+    key = source_key(src_path)
+    if key in existing_shards:
+        old_entry = existing_shards[key]
         shard_path_old = os.path.join(SHARD_DIR, old_entry["shard"])
         if src_size == old_entry.get("source_size", -1):
             skip_count += 1
@@ -537,12 +546,14 @@ print(f"  Workers: {args.workers}")
 def _apply_entry(entry):
     """Insert/update a manifest entry, then atomically persist manifest+meta."""
     global total_new_tokens, new_count
-    src = entry["source"]
-    if src in existing_shards:
-        shard_manifest["shards"] = [entry if s["source"] == src else s for s in shard_manifest["shards"]]
+    key = source_key(entry["source"])
+    if key in existing_shards:
+        # Match by (domain, basename) so an entry written under an old mount
+        # prefix gets updated with the current path — self-heals across mounts.
+        shard_manifest["shards"] = [entry if source_key(s["source"]) == key else s for s in shard_manifest["shards"]]
     else:
         shard_manifest["shards"].append(entry)
-    existing_shards[src] = entry
+    existing_shards[key] = entry
     total_new_tokens += entry["tokens"]
     new_count += 1
     shard_manifest["tokenization_id"] = current_tok_id
@@ -590,8 +601,9 @@ else:
         pool.shutdown(wait=True)
 
 # Re-sort manifest entries to source-file order for determinism across runs.
-order = {p: i for i, p in enumerate(all_source_files)}
-shard_manifest["shards"].sort(key=lambda s: order.get(s["source"], len(order)))
+# Key on (domain, basename) so entries with stale mount-prefix paths still sort.
+order = {source_key(p): i for i, p in enumerate(all_source_files)}
+shard_manifest["shards"].sort(key=lambda s: order.get(source_key(s["source"]), len(order)))
 atomic_dump_json(SHARD_MANIFEST_PATH, shard_manifest)
 save_meta(META_PATH, shard_manifest, vocab_size_actual, eot_id, pad_id, current_tok_id)
 
