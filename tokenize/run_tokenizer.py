@@ -281,6 +281,9 @@ parser.add_argument("--no-merge", action="store_true",
                     help="Skip the post-tokenization shard merge step")
 parser.add_argument("--merge-target-bytes", type=int, default=None,
                     help="Override config merge.target_bytes (e.g. 104857600 for 100 MB)")
+parser.add_argument("--rebuild-merge", action="store_true",
+                    help="Wipe token_shards_merged/ and re-merge from scratch. "
+                         "WARNING: invalidates seen_shards in any pretrain checkpoint.")
 args = parser.parse_args()
 
 # ---------- Discover source files ----------
@@ -600,10 +603,12 @@ else:
     finally:
         pool.shutdown(wait=True)
 
-# Re-sort manifest entries to source-file order for determinism across runs.
-# Key on (domain, basename) so entries with stale mount-prefix paths still sort.
-order = {source_key(p): i for i, p in enumerate(all_source_files)}
-shard_manifest["shards"].sort(key=lambda s: order.get(source_key(s["source"]), len(order)))
+# Re-sort manifest entries by shard index (append order). This is stable
+# under additions: existing shards keep their position, new shards always
+# land at the tail. Incremental merge requires this — sorting by source-
+# file alphabetical order would interleave new files into the middle and
+# break the prefix-match against existing merged_from records.
+shard_manifest["shards"].sort(key=lambda s: _idx_from_shard_name(s.get("shard", "")))
 atomic_dump_json(SHARD_MANIFEST_PATH, shard_manifest)
 save_meta(META_PATH, shard_manifest, vocab_size_actual, eot_id, pad_id, current_tok_id)
 
@@ -681,7 +686,7 @@ if merge_enabled:
     print(f"\n[4/4] Merging shards -> {merged_dir} (target {target_bytes / 1024 / 1024:.0f} MB)")
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from merge_shards import merge_shards as _merge_shards
-    _merge_shards(SHARD_DIR, merged_dir, target_bytes)
+    _merge_shards(SHARD_DIR, merged_dir, target_bytes, rebuild=args.rebuild_merge)
 elif args.no_merge:
     print("\n[4/4] Merge skipped (--no-merge).")
 else:
