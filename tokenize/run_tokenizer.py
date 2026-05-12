@@ -667,20 +667,11 @@ print(f"  tokenization_id: {current_tok_id}")
 merge_cfg = config.get("merge", {})
 merge_enabled = merge_cfg.get("enabled", False) and not args.no_merge
 if merge_enabled:
-    # Fail loud before merge if any manifest entry has no .bin on disk —
-    # merge_shards.py would sys.exit on the first missing input, but doing the
-    # check up front gives a clearer message and a full count.
-    missing_bins = [
-        s for s in shard_manifest.get("shards", [])
-        if not os.path.exists(os.path.join(SHARD_DIR, s.get("shard", "")))
-    ]
-    if missing_bins:
-        examples = ", ".join(s["shard"] for s in missing_bins[:5])
-        raise RuntimeError(
-            f"{len(missing_bins)} shard(s) in the manifest have no .bin on disk "
-            f"(examples: {examples}). Restore the tar archives into {SHARD_DIR} "
-            f"or re-run with --no-merge."
-        )
+    # merge_shards.py does its own targeted check: it only needs .bin files
+    # for inputs that will actually be re-read (i.e. inputs that go into a
+    # newly-written merged shard). Already-consumed inputs are immutable in
+    # the existing merged shards and don't need to be on disk. So we don't
+    # do a blanket .bin presence check here; the merge handles it precisely.
     target_bytes = args.merge_target_bytes or merge_cfg.get("target_bytes", 100 * 1024 * 1024)
     merged_dir = SHARD_DIR.rstrip("/") + "_merged"
     print(f"\n[4/4] Merging shards -> {merged_dir} (target {target_bytes / 1024 / 1024:.0f} MB)")

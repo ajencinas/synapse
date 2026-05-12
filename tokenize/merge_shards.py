@@ -452,6 +452,29 @@ def merge_shards(input_dir, output_dir, target_bytes, dry_run=False, rebuild=Fal
 
     _print_plan_summary(kept_merged, new_plan, target_bytes, rebuild=rebuild)
 
+    # Targeted .bin presence check: only the inputs that will actually be
+    # re-read need to be on disk. Already-consumed inputs are byte-frozen
+    # inside existing merged shards and don't get touched. This is what makes
+    # cold-tar backups workable: if no new sources were added, no input .bin
+    # ever needs to be unpacked from tar.
+    needed_bins = set()
+    for bucket in new_plan:
+        for s in bucket["sources"]:
+            needed_bins.add(s["shard"])
+    missing = sorted(
+        name for name in needed_bins
+        if not os.path.exists(os.path.join(input_dir, name))
+    )
+    if missing:
+        examples = ", ".join(missing[:5])
+        sys.exit(
+            f"{len(missing)} input shard(s) needed by the merge plan are not on disk "
+            f"at {input_dir} (examples: {examples}). These are inputs for newly-added "
+            f"merged shards — restore them before merging.\n"
+            f"  (Already-consumed inputs in tar archives can stay cold; only the {len(needed_bins)} "
+            f"input shard(s) referenced by NEW merged shards need to be unpacked.)"
+        )
+
     if dry_run:
         print("DRY RUN: no files written.")
         return None
