@@ -137,79 +137,121 @@ def _plan_incremental(in_manifest, existing_merged, target_bytes, dtype_bytes):
     kept_indexes: list of shard_idx integers parsed from kept_merged names —
                   used to pick the next index for new shards.
 
-    Raises SystemExit with a user-actionable message on any divergence between
-    the existing merged manifest and the current inputs.
-    """
-    input_by_domain, input_domain_order = _group_by_domain(in_manifest.get("shards", []))
-    existing_by_domain, _ = _group_by_domain(existing_merged.get("shards", []))
+    Verification is consumed-set based, not prefix-walk: the union of every
+    existing merged shard's merged_from records is the "consumed" set, and
+    we require it to be a subset of current inputs with matching token counts
+    (and matching domain). Two reasons this is the right invariant:
+      1. Existing merged .bin files are never rewritten — their byte content
+         is already locked in to whatever order the previous merge used. The
+         current input manifest's order has no influence on them.
+      2. Backward-compatible with merged manifests produced by older code
+         that sorted inputs differently (e.g. alphabetically by source name).
 
-    # Fail-loud: a domain present in existing merged but absent from current
-    # inputs means source data was removed. Incremental can't reconcile this.
-    input_domain_set = set(input_by_domain.keys())
-    for dom in existing_by_domain:
-        if dom not in input_domain_set:
+    Raises SystemExit on any genuine divergence: a consumed input that's been
+    removed from inputs, a token count that changed (retokenization), or a
+    domain reassignment.
+    """
+    # Index current inputs: name -> (domain, tokens, full_entry).
+    input_index = {}
+    duplicate_input_names = []
+    for s in in_manifest.get("shards", []):
+        dom = parent_dir_name(s.get("source", ""))
+        name = s.get("shard")
+        if not name:
+            continue
+        if name in input_index:
+            duplicate_input_names.append(name)
+        input_index[name] = (dom, s.get("tokens"), s)
+    if duplicate_input_names:
+        sys.exit(
+            f"Input manifest has {len(duplicate_input_names)} duplicate shard name(s): "
+            f"{duplicate_input_names[:5]}. Fix the input manifest before merging."
+        )
+
+    # Walk existing merged manifest, build consumed set, verify each reference.
+    consumed = set()  # input shard names that an existing merged shard claims
+    consumed_by_merged = {}  # input shard name -> existing merged shard that claims it
+    kept_merged = []
+    kept_indexes = []
+
+    for ms in existing_merged.get("shards", []):
+        ms_name = ms.get("shard")
+        ms_dom = ms.get("domain") or parent_dir_name(ms.get("source", ""))
+        refs = ms.get("merged_from", [])
+        if not refs:
             sys.exit(
-                f"Incremental merge: existing merged dir has shards for domain {dom!r}, "
-                f"but no inputs reference that domain anymore. Source data appears to "
-                f"have been removed.\n"
+                f"Incremental merge: existing merged shard {ms_name!r} has no merged_from "
+                f"record — can't verify what input shards it covers.\n"
                 f"  Pass --rebuild to wipe and re-merge from current inputs.\n"
                 f"  WARNING: --rebuild invalidates seen_shards in any pretrain checkpoint."
             )
-
-    kept_merged = []
-    kept_indexes = []
-    new_plan = []
-
-    for dom in input_domain_order:
-        input_queue = input_by_domain[dom]
-        existing_for_dom = existing_by_domain.get(dom, [])
-
-        input_idx = 0
-        for ms in existing_for_dom:
-            # Pop the merged_from prefix off the input queue and verify each
-            # entry matches by shard name AND token count. Token count guards
-            # against retokenization that kept the same shard name.
-            expected_inputs = ms.get("merged_from", [])
-            if not expected_inputs:
+        for ref in refs:
+            ref_name = ref.get("shard")
+            ref_tokens = ref.get("tokens")
+            if ref_name in consumed:
+                prev = consumed_by_merged[ref_name]
                 sys.exit(
-                    f"Incremental merge: existing merged shard {ms.get('shard')!r} has "
-                    f"no merged_from record — can't verify what input shards it covers.\n"
+                    f"Incremental merge: existing merged manifest references input "
+                    f"shard {ref_name!r} from two merged shards ({prev!r} and {ms_name!r}). "
+                    f"This corrupt state cannot be incrementally extended.\n"
                     f"  Pass --rebuild to wipe and re-merge from current inputs.\n"
                     f"  WARNING: --rebuild invalidates seen_shards in any pretrain checkpoint."
                 )
-            for expected in expected_inputs:
-                if input_idx >= len(input_queue):
-                    sys.exit(
-                        f"Incremental merge: existing merged shard {ms.get('shard')!r} "
-                        f"(domain={dom}) expects input {expected.get('shard')!r} but the "
-                        f"input queue for {dom} is exhausted. A source file was likely "
-                        f"removed from the input manifest.\n"
-                        f"  Pass --rebuild to wipe and re-merge from current inputs.\n"
-                        f"  WARNING: --rebuild invalidates seen_shards in any pretrain checkpoint."
-                    )
-                actual = input_queue[input_idx]
-                exp_name, exp_tok = expected.get("shard"), expected.get("tokens")
-                act_name, act_tok = actual.get("shard"), actual.get("tokens")
-                if act_name != exp_name or act_tok != exp_tok:
-                    sys.exit(
-                        f"Incremental merge: existing merged shard {ms.get('shard')!r} "
-                        f"(domain={dom}) expects input {exp_name!r} (tokens={exp_tok}) at "
-                        f"position {input_idx} of the {dom} queue, but found {act_name!r} "
-                        f"(tokens={act_tok}). Inputs have been reordered, removed, or "
-                        f"retokenized after the last merge.\n"
-                        f"  Pass --rebuild to wipe and re-merge from current inputs.\n"
-                        f"  WARNING: --rebuild invalidates seen_shards in any pretrain checkpoint."
-                    )
-                input_idx += 1
+            consumed.add(ref_name)
+            consumed_by_merged[ref_name] = ms_name
 
-            kept_merged.append(ms)
-            idx = _idx_from_shard_name(ms.get("shard", ""))
-            if idx >= 0:
-                kept_indexes.append(idx)
+            if ref_name not in input_index:
+                sys.exit(
+                    f"Incremental merge: existing merged shard {ms_name!r} (domain={ms_dom}) "
+                    f"references input shard {ref_name!r} which is no longer in the input "
+                    f"manifest. A source file was removed.\n"
+                    f"  Pass --rebuild to wipe and re-merge from current inputs.\n"
+                    f"  WARNING: --rebuild invalidates seen_shards in any pretrain checkpoint."
+                )
+            cur_dom, cur_tokens, _ = input_index[ref_name]
+            if cur_tokens != ref_tokens:
+                sys.exit(
+                    f"Incremental merge: existing merged shard {ms_name!r} expects input "
+                    f"{ref_name!r} to have {ref_tokens} tokens, but current input has "
+                    f"{cur_tokens}. This source has been retokenized.\n"
+                    f"  Pass --rebuild to wipe and re-merge from current inputs.\n"
+                    f"  WARNING: --rebuild invalidates seen_shards in any pretrain checkpoint."
+                )
+            if cur_dom != ms_dom:
+                sys.exit(
+                    f"Incremental merge: existing merged shard {ms_name!r} claims domain "
+                    f"{ms_dom!r} for input {ref_name!r}, but current input places it in "
+                    f"domain {cur_dom!r}. Source layout has changed.\n"
+                    f"  Pass --rebuild to wipe and re-merge from current inputs.\n"
+                    f"  WARNING: --rebuild invalidates seen_shards in any pretrain checkpoint."
+                )
 
-        remaining = input_queue[input_idx:]
-        if remaining:
-            new_plan.extend(_bucket_for_domain(remaining, dom, target_bytes, dtype_bytes))
+        kept_merged.append(ms)
+        idx = _idx_from_shard_name(ms_name or "")
+        if idx >= 0:
+            kept_indexes.append(idx)
+
+    # Remaining input shards (not in any existing merged shard) -> new buckets.
+    # Group by domain, sort by shard index ascending so new content lands at
+    # the tail of each domain in a stable order regardless of how the input
+    # manifest happens to be sorted.
+    remaining_by_domain = {}
+    domain_order = []  # first-seen order in input manifest
+    for s in in_manifest.get("shards", []):
+        name = s.get("shard")
+        if name in consumed:
+            continue
+        dom = parent_dir_name(s.get("source", ""))
+        if dom not in remaining_by_domain:
+            remaining_by_domain[dom] = []
+            domain_order.append(dom)
+        remaining_by_domain[dom].append(s)
+
+    new_plan = []
+    for dom in domain_order:
+        bucket_inputs = sorted(remaining_by_domain[dom],
+                               key=lambda s: _idx_from_shard_name(s.get("shard", "")))
+        new_plan.extend(_bucket_for_domain(bucket_inputs, dom, target_bytes, dtype_bytes))
 
     return kept_merged, new_plan, kept_indexes
 
