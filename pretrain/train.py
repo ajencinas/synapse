@@ -184,16 +184,23 @@ GRAD_CLIP        = 1.0
 # -- DATA SELECTION --
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", 42_000_000_000))
 
+# Each entry is either a plain float (= weight; trained for 1 epoch) or a dict
+# {"weight": w, "max_epochs": k} where the source's shards may be repeated up to
+# k times to fill its w*MAX_TOKENS budget. Used for supply-constrained sources:
+# wikipedia (4.86 B available, 16 B target) needs ~4 passes; the tiny books and
+# distilled_facts sources are repeated more aggressively to lift them above 0%.
 DATA_MIX = {
-    "data_wikipedia":       0.40,
-    "data_c4":              0.20,
-    "data_code":            0.15,
-    "data_finemath":        0.10,
-    "data_books_gutemberg": 0.05,
-    "data_books_faded":     0.03,
-    "data_arxiv":           0.02,
-    "data_adult":           0.02,
-    "data_distilled_facts": 0.03,
+    "data_wikipedia":       {"weight": 1.00, "max_epochs": 4},
+    # Disabled for this run — restore by uncommenting (weights sum to 1.00):
+    # "data_wikipedia":       {"weight": 0.40, "max_epochs": 4},
+    # "data_c4":              0.20,
+    # "data_code":            0.15,
+    # "data_finemath":        0.10,
+    # "data_books_gutemberg": {"weight": 0.05, "max_epochs": 20},
+    # "data_books_faded":     {"weight": 0.03, "max_epochs": 20},
+    # "data_arxiv":           0.02,
+    # "data_adult":           {"weight": 0.02, "max_epochs": 20},
+    # "data_distilled_facts": {"weight": 0.03, "max_epochs": 20},
 }
 
 # -- EVAL --
@@ -398,7 +405,9 @@ print(f"Model: {n_params/1e9:.3f}B params ({n_trainable/1e9:.3f}B trainable)")
 resume_path = None
 _saved_optimizer_state = None
 _saved_curr_step = 0
-_saved_seen_shards = set()
+# seen_shards is a list (with potential duplicates, one entry per training pass
+# through that shard) so multi-epoch sources track their consumed passes.
+_saved_seen_shards = []
 if os.path.exists(CHECKPOINT_PATH):
     train_manifest_path = os.path.join(MANIFEST_DIR, "training_latest.json")
     safe_to_load = True
@@ -420,7 +429,7 @@ if os.path.exists(CHECKPOINT_PATH):
             state_dict = ckpt_obj["model"]
             _saved_optimizer_state = ckpt_obj.get("optimizer")
             _saved_curr_step = int(ckpt_obj.get("curr_step", 0))
-            _saved_seen_shards = set(ckpt_obj.get("seen_shards", []))
+            _saved_seen_shards = list(ckpt_obj.get("seen_shards", []))
             print(f"  v2 checkpoint: step={_saved_curr_step}, "
                   f"seen_shards={len(_saved_seen_shards)}, "
                   f"optimizer_state={'yes' if _saved_optimizer_state else 'no'}")
@@ -544,7 +553,13 @@ if DATA_MIX is None:
         running += s["tokens"]
 else:
     budget = MAX_TOKENS if MAX_TOKENS else sum(s["tokens"] for ss in train_pool_by_source.values() for s in ss)
-    for source, weight in DATA_MIX.items():
+    for source, spec in DATA_MIX.items():
+        if isinstance(spec, dict):
+            weight = float(spec["weight"])
+            max_epochs = int(spec.get("max_epochs", 1))
+        else:
+            weight = float(spec)
+            max_epochs = 1
         source_budget = int(budget * weight)
         available = train_pool_by_source.get(source, [])
         if not available:
@@ -552,25 +567,35 @@ else:
             continue
         random.shuffle(available)
         running = 0
-        for s in available:
+        # Repeat shards up to max_epochs to fill the source budget. Each pass
+        # adds the whole shuffled list again until the budget is hit or we've
+        # reached max_epochs (whichever comes first).
+        for _ in range(max_epochs):
             if running >= source_budget:
                 break
-            selected_shards.append(s)
-            running += s["tokens"]
+            for s in available:
+                if running >= source_budget:
+                    break
+                selected_shards.append(s)
+                running += s["tokens"]
 
 selected_tokens = sum(s["tokens"] for s in selected_shards)
 
 print(f"\nSelected for training:")
-selected_by_source = defaultdict(lambda: {"shards": 0, "tokens": 0})
+selected_by_source = defaultdict(lambda: {"passes": 0, "tokens": 0, "unique": set()})
 for s in selected_shards:
     src = get_source_name(s)
-    selected_by_source[src]["shards"] += 1
+    selected_by_source[src]["passes"] += 1
     selected_by_source[src]["tokens"] += s["tokens"]
+    selected_by_source[src]["unique"].add(s["shard"])
 for src, info in sorted(selected_by_source.items()):
     total_available = sum(s["tokens"] for s in shards_by_source.get(src, []))
     pct = info["tokens"] / total_available * 100 if total_available else 0
-    print(f"  {src}: {info['shards']} shards, {info['tokens']:,} tokens ({pct:.0f}% of available)")
-print(f"\n  TOTAL: {len(selected_shards)} shards, {selected_tokens:,} tokens")
+    n_unique = len(info["unique"])
+    epoch_note = f" x{info['passes']/n_unique:.1f}ep" if info["passes"] > n_unique else ""
+    print(f"  {src}: {n_unique} shards{epoch_note}, "
+          f"{info['tokens']:,} tokens ({pct:.0f}% of available)")
+print(f"\n  TOTAL: {len(selected_shards)} shard-passes, {selected_tokens:,} tokens")
 
 
 # ==================== 7b. STAGE SHARDS TO LOCAL DISK ====================
@@ -624,12 +649,24 @@ print(f"  Effective Batch Size: {BATCH_SIZE * GRAD_ACCUM_STEPS} sequences "
 print(f"  Total optimizer steps: {total_steps:,} | Warmup: {WARMUP_STEPS}")
 print(f"  Mid-epoch save every {SAVE_EVERY_N_SHARDS} shards | Eval every {EVAL_EVERY_STEPS} steps")
 
-# Drop shards that were already trained in a previous run (v2 checkpoint).
+# Drop already-trained passes from the planned selection. seen_shards may
+# contain duplicates (one entry per pass), so subtract counts not membership:
+# if wikipedia shard X has 4 planned passes and 2 are already in seen_shards,
+# 2 remain in selected_shards.
 if _saved_seen_shards:
+    seen_counts = defaultdict(int)
+    for name in _saved_seen_shards:
+        seen_counts[name] += 1
     before = len(selected_shards)
-    selected_shards = [s for s in selected_shards if s["shard"] not in _saved_seen_shards]
-    print(f"  Skipping {before - len(selected_shards)} already-trained shards from prior run "
-          f"({len(selected_shards)} remaining)")
+    remaining = []
+    for s in selected_shards:
+        if seen_counts[s["shard"]] > 0:
+            seen_counts[s["shard"]] -= 1
+        else:
+            remaining.append(s)
+    selected_shards = remaining
+    print(f"  Skipping {before - len(selected_shards)} already-trained shard-passes "
+          f"from prior run ({len(selected_shards)} remaining)")
 
 
 # ==================== 9. EVAL HELPER ====================
