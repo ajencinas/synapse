@@ -191,15 +191,17 @@ MAX_TOKENS = int(os.environ.get("MAX_TOKENS", 42_000_000_000))
 # budget is filled. Proportions roughly track LLaMA's pretrain mix: web text
 # dominates, code for reasoning, wiki/arxiv/finemath as supplementary signal.
 DATA_MIX = {
-    "data_c4":              0.45,
-    "data_code":            0.20,
-    "data_arxiv":           0.10,
-    "data_finemath":        0.10,
-    "data_wikipedia":       0.10,
-    "data_books_gutemberg": 0.02,
-    "data_distilled_facts": 0.01,
-    "data_books_faded":     0.01,
-    "data_adult":           0.01,
+    "data_c4":               0.42,
+    "data_code":             0.20,
+    "data_arxiv":            0.10,
+    "data_finemath":         0.10,
+    "data_wikipedia":        0.10,
+    "data_books_gutemberg":  0.02,
+    "data_math_operations":  0.02,
+    "data_distilled_facts":  0.01,
+    "data_books_faded":      0.01,
+    "data_math_text":        0.01,
+    "data_adult":            0.01,
 }
 
 # -- EVAL --
