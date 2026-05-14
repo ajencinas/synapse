@@ -188,19 +188,20 @@ MAX_TOKENS = int(os.environ.get("MAX_TOKENS", 42_000_000_000))
 # {"weight": w, "max_epochs": k} where the source's shards may be repeated up to
 # k times to fill its w*MAX_TOKENS budget. Single-epoch run across all sources;
 # supply-constrained sources will simply hit their token cap before the weight
-# budget is filled.
+# budget is filled. Proportions roughly track LLaMA's pretrain mix: web text
+# dominates, code for reasoning, wiki/arxiv/finemath as supplementary signal.
 DATA_MIX = {
-    "data_wikipedia":        0.37,
-    "data_c4":               0.20,
-    "data_code":             0.15,
+    "data_c4":               0.42,
+    "data_code":             0.20,
+    "data_arxiv":            0.10,
     "data_finemath":         0.10,
-    "data_books_gutemberg":  0.05,
-    "data_books_faded":      0.03,
-    "data_distilled_facts":  0.03,
-    "data_arxiv":            0.02,
-    "data_adult":            0.02,
+    "data_wikipedia":        0.10,
+    "data_books_gutemberg":  0.02,
     "data_math_operations":  0.02,
+    "data_distilled_facts":  0.01,
+    "data_books_faded":      0.01,
     "data_math_text":        0.01,
+    "data_adult":            0.01,
 }
 
 # -- EVAL --
