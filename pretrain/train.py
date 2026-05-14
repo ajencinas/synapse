@@ -186,21 +186,19 @@ MAX_TOKENS = int(os.environ.get("MAX_TOKENS", 42_000_000_000))
 
 # Each entry is either a plain float (= weight; trained for 1 epoch) or a dict
 # {"weight": w, "max_epochs": k} where the source's shards may be repeated up to
-# k times to fill its w*MAX_TOKENS budget. Used for supply-constrained sources:
-# wikipedia is repeated 2x to refresh without over-fitting; the tiny books and
-# distilled_facts sources are repeated more aggressively to lift them above 0%.
+# k times to fill its w*MAX_TOKENS budget. Single-epoch run across all sources;
+# supply-constrained sources will simply hit their token cap before the weight
+# budget is filled.
 DATA_MIX = {
-    "data_wikipedia":       {"weight": 1.00, "max_epochs": 2},
-    # Disabled for this run — restore by uncommenting (weights sum to 1.00):
-    # "data_wikipedia":       {"weight": 0.40, "max_epochs": 4},
-    # "data_c4":              0.20,
-    # "data_code":            0.15,
-    # "data_finemath":        0.10,
-    # "data_books_gutemberg": {"weight": 0.05, "max_epochs": 20},
-    # "data_books_faded":     {"weight": 0.03, "max_epochs": 20},
-    # "data_arxiv":           0.02,
-    # "data_adult":           {"weight": 0.02, "max_epochs": 20},
-    # "data_distilled_facts": {"weight": 0.03, "max_epochs": 20},
+    "data_wikipedia":       0.40,
+    "data_c4":              0.20,
+    "data_code":            0.15,
+    "data_finemath":        0.10,
+    "data_books_gutemberg": 0.05,
+    "data_books_faded":     0.03,
+    "data_arxiv":           0.02,
+    "data_adult":           0.02,
+    "data_distilled_facts": 0.03,
 }
 
 # -- EVAL --
