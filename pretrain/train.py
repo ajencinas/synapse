@@ -187,10 +187,10 @@ MAX_TOKENS = int(os.environ.get("MAX_TOKENS", 42_000_000_000))
 # Each entry is either a plain float (= weight; trained for 1 epoch) or a dict
 # {"weight": w, "max_epochs": k} where the source's shards may be repeated up to
 # k times to fill its w*MAX_TOKENS budget. Used for supply-constrained sources:
-# wikipedia (4.86 B available, 16 B target) needs ~4 passes; the tiny books and
+# wikipedia is repeated 2x to refresh without over-fitting; the tiny books and
 # distilled_facts sources are repeated more aggressively to lift them above 0%.
 DATA_MIX = {
-    "data_wikipedia":       {"weight": 1.00, "max_epochs": 4},
+    "data_wikipedia":       {"weight": 1.00, "max_epochs": 2},
     # Disabled for this run — restore by uncommenting (weights sum to 1.00):
     # "data_wikipedia":       {"weight": 0.40, "max_epochs": 4},
     # "data_c4":              0.20,
