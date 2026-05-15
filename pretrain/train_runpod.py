@@ -91,11 +91,13 @@ def main():
         capture_output=True, text=True, timeout=30
     )
     if ckpt_exists.returncode == 0 and ckpt_exists.stdout.strip():
-        run(["rclone", "copy", CKPT_REMOTE, CKPT_LOCAL,
-             "--include", "*.pth", "--max-age", "30d",
-             "--transfers", "1", "--drive-chunk-size", "64M",
+        # Only pull the latest checkpoint (not archived ones with date suffix)
+        ckpt_name = os.environ.get("CHECKPOINT_NAME", "synapse_2b_d2560_l28.pth")
+        run(["rclone", "copyto",
+             f"{CKPT_REMOTE}/{ckpt_name}",
+             os.path.join(CKPT_LOCAL, ckpt_name),
              "--checksum", "--progress"],
-            desc="pulling existing checkpoint", check=False)
+            desc="pulling latest checkpoint", check=False)
     else:
         print("  no existing checkpoint found on Drive")
 
