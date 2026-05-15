@@ -93,7 +93,8 @@ def main():
     if ckpt_exists.returncode == 0 and ckpt_exists.stdout.strip():
         run(["rclone", "copy", CKPT_REMOTE, CKPT_LOCAL,
              "--include", "*.pth", "--max-age", "30d",
-             "--transfers", "1", "--drive-chunk-size", "64M", "--checksum"],
+             "--transfers", "1", "--drive-chunk-size", "64M",
+             "--checksum", "--progress"],
             desc="pulling existing checkpoint", check=False)
     else:
         print("  no existing checkpoint found on Drive")
@@ -105,7 +106,7 @@ def main():
     if mf_exists.returncode == 0 and mf_exists.stdout.strip():
         run(["rclone", "copy", MANIFEST_REMOTE, MANIFEST_LOCAL,
              "--include", "training_latest.json",
-             "--transfers", "1", "--checksum"],
+             "--transfers", "1", "--checksum", "--progress"],
             desc="pulling existing manifest", check=False)
     else:
         print("  no existing manifest found on Drive")
