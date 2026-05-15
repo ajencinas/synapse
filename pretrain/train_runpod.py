@@ -101,7 +101,7 @@ def main():
                  CKPT_REMOTE, CKPT_LOCAL,
                  "--include", pick,
                  "--transfers", "1", "--drive-chunk-size", "64M",
-                 "--checksum", "--progress"],
+                 "--progress", "--stats", "10s", "--stats-one-line"],
                 desc=f"pulling checkpoint ({pick})", check=False)
         else:
             print("  no .pth checkpoint found on Drive")
