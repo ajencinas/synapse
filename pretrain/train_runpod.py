@@ -91,13 +91,22 @@ def main():
         capture_output=True, text=True, timeout=30
     )
     if ckpt_exists.returncode == 0 and ckpt_exists.stdout.strip():
-        # Only pull the latest checkpoint (not archived ones with date suffix)
+        # Find most recent checkpoint: prefer main name, fall back to latest archive
         ckpt_name = os.environ.get("CHECKPOINT_NAME", "synapse_2b_d2560_l28.pth")
-        run(["rclone", "copyto",
-             f"{CKPT_REMOTE}/{ckpt_name}",
-             os.path.join(CKPT_LOCAL, ckpt_name),
-             "--checksum", "--progress"],
-            desc="pulling latest checkpoint", check=False)
+        lines = [l.strip().split()[-1] for l in ckpt_exists.stdout.strip().split("\n") if l.strip()]
+        if ckpt_name in lines:
+            pick = ckpt_name
+        else:
+            # Pick most recently modified .pth (rclone ls sorts by name, not time)
+            pick = sorted([l for l in lines if l.endswith(".pth")])[-1] if lines else None
+        if pick:
+            run(["rclone", "copyto",
+                 f"{CKPT_REMOTE}/{pick}",
+                 os.path.join(CKPT_LOCAL, pick),
+                 "--checksum", "--progress"],
+                desc=f"pulling checkpoint ({pick})", check=False)
+        else:
+            print("  no .pth checkpoint found on Drive")
     else:
         print("  no existing checkpoint found on Drive")
 
