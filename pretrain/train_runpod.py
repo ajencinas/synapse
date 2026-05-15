@@ -20,6 +20,7 @@ import time
 import json
 import random
 import subprocess
+from collections import defaultdict
 
 GDRIVE_REMOTE = os.environ.get("GDRIVE_REMOTE", "gdrive")
 GDRIVE_PATH = os.environ.get("GDRIVE_PATH", "synapse")
@@ -70,6 +71,7 @@ def main():
         sys.exit(1)
     print(f"  remote '{GDRIVE_REMOTE}:' OK\n")
 
+    os.makedirs(LOCAL_DIR, exist_ok=True)
     os.makedirs(SHARD_LOCAL, exist_ok=True)
     os.makedirs(CKPT_LOCAL, exist_ok=True)
     os.makedirs(MANIFEST_LOCAL, exist_ok=True)
@@ -96,41 +98,100 @@ def main():
     else:
         print("  no existing checkpoint found on Drive")
 
-    run(["rclone", "copy", MANIFEST_REMOTE, MANIFEST_LOCAL,
-         "--include", "training_latest.json",
-         "--transfers", "1", "--checksum"],
-        desc="pulling existing manifest", check=False)
+    mf_exists = subprocess.run(
+        ["rclone", "ls", MANIFEST_REMOTE, "--max-depth", "1"],
+        capture_output=True, text=True, timeout=30
+    )
+    if mf_exists.returncode == 0 and mf_exists.stdout.strip():
+        run(["rclone", "copy", MANIFEST_REMOTE, MANIFEST_LOCAL,
+             "--include", "training_latest.json",
+             "--transfers", "1", "--checksum"],
+            desc="pulling existing manifest", check=False)
+    else:
+        print("  no existing manifest found on Drive")
 
-    # ── 4. Select shards within budget ──
+    # ── 4. Verify Python deps ──
+    missing_deps = []
+    for mod_name in ("torch", "numpy", "tqdm"):
+        try:
+            __import__(mod_name)
+        except ImportError:
+            missing_deps.append(mod_name)
+    if missing_deps:
+        print(f"ERROR: missing Python packages: {', '.join(missing_deps)}")
+        print("Run: pip install torch numpy tqdm")
+        sys.exit(1)
+    print("  Python deps: OK")
+
+    # ── 5. Select shards matching train.py's DATA_MIX ──
     if SKIP_DATA_PULL:
         print("[data] SKIP_DATA_PULL=1 — skipping shard pull, using existing local")
     else:
-        with open(os.path.join(SHARD_LOCAL, "shard_manifest.json")) as f:
+        manifest_path = os.path.join(SHARD_LOCAL, "shard_manifest.json")
+        if not os.path.exists(manifest_path):
+            print(f"ERROR: {manifest_path} not found.")
+            print(f"  Check that GDRIVE_PATH={GDRIVE_PATH!r} is correct")
+            print(f"  and that token_shards_merged/ exists on Drive.")
+            sys.exit(1)
+
+        with open(manifest_path) as f:
             manifest = json.load(f)
 
-        shards = manifest["shards"]
+        all_shards = manifest["shards"]
+
+        # Group by source (same logic as train.py: get_source_name)
+        def get_source_name(shard_entry):
+            source = shard_entry.get("source", "")
+            parts = source.replace("\\", "/").split("/")
+            for p in parts:
+                if p.startswith("data_"):
+                    return p
+            return "other"
+
+        shards_by_source = defaultdict(list)
+        for s in all_shards:
+            shards_by_source[get_source_name(s)].append(s)
+
         random.seed(42)
-        random.shuffle(shards)
+        selected_shards = []
+        DATA_MIX = {
+            "data_c4":               0.42,
+            "data_code":             0.20,
+            "data_arxiv":            0.10,
+            "data_finemath":         0.10,
+            "data_wikipedia":        0.10,
+            "data_books_gutemberg":  0.02,
+            "data_math_operations":  0.02,
+            "data_distilled_facts":  0.01,
+            "data_books_faded":      0.01,
+            "data_math_text":        0.01,
+            "data_adult":            0.01,
+        }
+        budget = TOKEN_BUDGET
+        for source, weight in DATA_MIX.items():
+            source_budget = int(budget * weight)
+            available = shards_by_source.get(source, [])
+            if not available:
+                print(f"  WARNING: {source} not found in shards, skipping")
+                continue
+            random.shuffle(available)
+            running = 0
+            for s in available:
+                if running >= source_budget:
+                    break
+                selected_shards.append(s)
+                running += s["tokens"]
 
-        selected = []
-        running = 0
-        for s in shards:
-            if running >= TOKEN_BUDGET:
-                break
-            selected.append(s)
-            running += s["tokens"]
+        selected_tokens = sum(s["tokens"] for s in selected_shards)
+        print(f"\n[data] Selected {len(selected_shards)} shards ({selected_tokens:,} tokens)")
 
-        print(f"\n[data] Selected {len(selected)} shards ({running:,} tokens) "
-              f"from {len(shards)} available")
-
-        # ── 5. Pull only selected shards via rclone copy ──
-        # Write a temp file list for rclone's --files-from
+        # ── 6. Pull selected shards via rclone copy ──
         list_path = os.path.join(LOCAL_DIR, "selected_shards.txt")
         with open(list_path, "w") as f:
-            for s in selected:
+            for s in selected_shards:
                 f.write(s["shard"] + "\n")
 
-        print(f"[data] Pulling {len(selected)} shards to {SHARD_LOCAL}...")
+        print(f"[data] Pulling {len(selected_shards)} shards to {SHARD_LOCAL}...")
         t0 = time.time()
         run(["rclone", "copy", SHARD_REMOTE, SHARD_LOCAL,
              "--files-from", list_path,
@@ -140,10 +201,13 @@ def main():
         print(f"[data] Done in {time.time()-t0:.0f}s")
         os.remove(list_path)
 
-    # ── 6. Launch train.py ──
+    # ── 7. Launch train.py ──
     train_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "train.py")
     if not os.path.exists(train_script):
         train_script = os.path.join(os.getcwd(), "pretrain", "train.py")
+    if not os.path.exists(train_script):
+        print("ERROR: train.py not found. Run this script from the synapse repo root.")
+        sys.exit(1)
 
     env = os.environ.copy()
     env["SYNAPSE_DIR"] = SYNAPSE_LOCAL
