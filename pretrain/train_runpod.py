@@ -28,6 +28,8 @@ LOCAL_DIR = os.environ.get("LOCAL_DIR", "/workspace/synapse_data")
 DEFAULT_TOKEN_BUDGET = 5_000_000_000
 TOKEN_BUDGET = int(os.environ.get("MAX_TOKENS", os.environ.get("TOKEN_BUDGET", str(DEFAULT_TOKEN_BUDGET))))
 SKIP_DATA_PULL = os.environ.get("SKIP_DATA_PULL", "0") == "1"
+SKIP_RESUME = os.environ.get("SKIP_RESUME", "0") == "1"
+SKIP_RESUME = os.environ.get("SKIP_RESUME", "0") == "1"
 
 SHARD_REMOTE = f"{GDRIVE_REMOTE}:{GDRIVE_PATH}/token_shards_merged"
 CKPT_REMOTE = f"{GDRIVE_REMOTE}:{GDRIVE_PATH}/checkpoints"
@@ -90,7 +92,15 @@ def main():
         ["rclone", "ls", CKPT_REMOTE, "--max-depth", "1"],
         capture_output=True, text=True, timeout=30
     )
-    if ckpt_exists.returncode == 0 and ckpt_exists.stdout.strip():
+    if SKIP_RESUME:
+        print("[resume] SKIP_RESUME=1 — skipping checkpoint pull (starting from scratch)")
+        # Wipe local checkpoint dir to ensure fresh start
+        import shutil
+        if os.path.isdir(CKPT_LOCAL):
+            for f in os.listdir(CKPT_LOCAL):
+                if f.endswith(".pth"):
+                    os.remove(os.path.join(CKPT_LOCAL, f))
+    elif ckpt_exists.returncode == 0 and ckpt_exists.stdout.strip():
         lines = [l.strip().split()[-1] for l in ckpt_exists.stdout.strip().split("\n") if l.strip()]
         pth_files = sorted([l for l in lines if l.endswith(".pth")])
         if pth_files:
