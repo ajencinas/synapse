@@ -83,11 +83,19 @@ def main():
                  "--checksum"],
                 desc=f"pulling {f}")
 
-    # ── 3. Pull existing checkpoint + manifest for resume ──
-    run(["rclone", "copy", CKPT_REMOTE, CKPT_LOCAL,
-         "--include", "*.pth", "--max-age", "30d",
-         "--transfers", "1", "--drive-chunk-size", "64M", "--checksum"],
-        desc="pulling existing checkpoint", check=False)
+    # ── 3. Pull existing checkpoint + manifest for resume (skip if remote dir empty) ──
+    ckpt_exists = subprocess.run(
+        ["rclone", "ls", CKPT_REMOTE, "--max-depth", "1"],
+        capture_output=True, text=True, timeout=30
+    )
+    if ckpt_exists.returncode == 0 and ckpt_exists.stdout.strip():
+        run(["rclone", "copy", CKPT_REMOTE, CKPT_LOCAL,
+             "--include", "*.pth", "--max-age", "30d",
+             "--transfers", "1", "--drive-chunk-size", "64M", "--checksum"],
+            desc="pulling existing checkpoint", check=False)
+    else:
+        print("  no existing checkpoint found on Drive")
+
     run(["rclone", "copy", MANIFEST_REMOTE, MANIFEST_LOCAL,
          "--include", "training_latest.json",
          "--transfers", "1", "--checksum"],
