@@ -91,18 +91,16 @@ def main():
         capture_output=True, text=True, timeout=30
     )
     if ckpt_exists.returncode == 0 and ckpt_exists.stdout.strip():
-        # Find most recent checkpoint: prefer main name, fall back to latest archive
-        ckpt_name = os.environ.get("CHECKPOINT_NAME", "synapse_2b_d2560_l28.pth")
         lines = [l.strip().split()[-1] for l in ckpt_exists.stdout.strip().split("\n") if l.strip()]
-        if ckpt_name in lines:
-            pick = ckpt_name
-        else:
-            # Pick most recently modified .pth (rclone ls sorts by name, not time)
-            pick = sorted([l for l in lines if l.endswith(".pth")])[-1] if lines else None
-        if pick:
-            run(["rclone", "copyto",
-                 f"{CKPT_REMOTE}/{pick}",
-                 os.path.join(CKPT_LOCAL, pick),
+        pth_files = sorted([l for l in lines if l.endswith(".pth")])
+        if pth_files:
+            # Prefer main checkpoint, else pick latest alphabetically (newest archive)
+            ckpt_name = os.environ.get("CHECKPOINT_NAME", "synapse_2b_d2560_l28.pth")
+            pick = ckpt_name if ckpt_name in pth_files else pth_files[-1]
+            run(["rclone", "copy",
+                 CKPT_REMOTE, CKPT_LOCAL,
+                 "--include", pick,
+                 "--transfers", "1", "--drive-chunk-size", "64M",
                  "--checksum", "--progress"],
                 desc=f"pulling checkpoint ({pick})", check=False)
         else:
