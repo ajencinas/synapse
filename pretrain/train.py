@@ -180,6 +180,11 @@ WEIGHT_DECAY     = 0.1
 WARMUP_STEPS     = 1000
 BETAS            = (0.9, 0.95)
 GRAD_CLIP        = 1.0
+# LR cosine horizon. Anchors the schedule to the LIFETIME training plan, not
+# to per-run shard selection — without this, curr_step (cumulative) overruns
+# the per-run-computed total_steps on every resume and LR collapses to MIN_LR.
+# 190_735 = 100B tokens / (BATCH_SIZE*GRAD_ACCUM_STEPS*BLOCK_SIZE).
+LR_HORIZON_STEPS = 190_735
 
 # -- DATA SELECTION --
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", 42_000_000_000))
@@ -638,16 +643,18 @@ def _stage_shards_locally(src_dir, selected, evals):
 SHARD_DIR = _stage_shards_locally(SHARD_DIR, selected_shards, eval_shards)
 
 
-# ==================== 8. COMPUTE TOTAL STEPS ====================
-# Anchor total_steps to the full selection BEFORE seen-shard filtering, so
-# the LR cosine schedule stays calibrated against the original training plan.
-samples_approx = selected_tokens // BLOCK_SIZE
-batches_total = samples_approx // BATCH_SIZE
-total_steps = (batches_total * EPOCHS) // GRAD_ACCUM_STEPS
+# ==================== 8. LR SCHEDULE HORIZON ====================
+# total_steps drives the cosine schedule and MUST be a lifetime constant
+# (LR_HORIZON_STEPS), not per-run. Otherwise curr_step (cumulative across
+# resumes) overruns this-run's-selection total and LR floors at MIN_LR.
+total_steps = LR_HORIZON_STEPS
+this_run_steps = (selected_tokens // BLOCK_SIZE // BATCH_SIZE * EPOCHS) // GRAD_ACCUM_STEPS
 
 print(f"  Effective Batch Size: {BATCH_SIZE * GRAD_ACCUM_STEPS} sequences "
       f"({BATCH_SIZE * GRAD_ACCUM_STEPS * BLOCK_SIZE:,} tokens/step)")
-print(f"  Total optimizer steps: {total_steps:,} | Warmup: {WARMUP_STEPS}")
+print(f"  LR horizon (lifetime): {total_steps:,} steps | Warmup: {WARMUP_STEPS} | "
+      f"resuming at step {_saved_curr_step:,} ({_saved_curr_step/total_steps:.1%} through)")
+print(f"  This run will add ~{this_run_steps:,} steps")
 print(f"  Mid-epoch save every {SAVE_EVERY_N_SHARDS} shards | Eval every {EVAL_EVERY_STEPS} steps")
 
 # Drop already-trained passes from the planned selection. seen_shards may
@@ -882,6 +889,7 @@ manifest = {
         "eval_history": eval_history,
         "last_grad_norm": last_grad_norm,
         "total_optimizer_steps": curr_step,
+        "lr_horizon_steps": LR_HORIZON_STEPS,
         "total_hours": round(total_time / 3600, 2),
         "resumed_from": resume_path,
     },
