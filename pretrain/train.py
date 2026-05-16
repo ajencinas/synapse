@@ -80,14 +80,35 @@ def file_hash(path):
             h.update(chunk)
     return h.hexdigest()
 
-def file_info(path):
+def partial_file_hash(path, edge=1 << 20):
+    # Hash first + last `edge` bytes and mix in total size. Bounded I/O regardless
+    # of file size — fine as a change-detector / partial-upload check for the
+    # manifest, NOT a tamper-proof integrity hash. torch.save's zip layout puts
+    # the central directory at the tail, so any tensor change shifts those bytes.
+    size = os.path.getsize(path)
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        h.update(f.read(min(edge, size)))
+        if size > 2 * edge:
+            f.seek(-edge, 2)
+            h.update(f.read(edge))
+    h.update(size.to_bytes(8, "little"))
+    return h.hexdigest()
+
+def file_info(path, *, full_hash=False):
     if not os.path.exists(path):
         return {"path": path, "exists": False}
-    return {
+    size = os.path.getsize(path)
+    info = {
         "path": path,
-        "size_mb": round(os.path.getsize(path) / 1024 / 1024, 2),
-        "sha256": file_hash(path),
+        "size_mb": round(size / 1024 / 1024, 2),
+        "size_bytes": size,
     }
+    if full_hash:
+        info["sha256"] = file_hash(path)
+    else:
+        info["sha256_partial"] = partial_file_hash(path)
+    return info
 
 def filter_present_shards(shards, shard_dir, dtype_bytes):
     # Drop manifest entries whose .bin is absent or wrong-size; lets training
@@ -414,6 +435,8 @@ _saved_curr_step = 0
 # seen_shards is a list (with potential duplicates, one entry per training pass
 # through that shard) so multi-epoch sources track their consumed passes.
 _saved_seen_shards = []
+_saved_eval_history = []
+_saved_last_eval_loss = None
 if os.path.exists(CHECKPOINT_PATH):
     train_manifest_path = os.path.join(MANIFEST_DIR, "training_latest.json")
     safe_to_load = True
@@ -436,8 +459,11 @@ if os.path.exists(CHECKPOINT_PATH):
             _saved_optimizer_state = ckpt_obj.get("optimizer")
             _saved_curr_step = int(ckpt_obj.get("curr_step", 0))
             _saved_seen_shards = list(ckpt_obj.get("seen_shards", []))
+            _saved_eval_history = list(ckpt_obj.get("eval_history", []))
+            _saved_last_eval_loss = ckpt_obj.get("last_eval_loss")
             print(f"  v2 checkpoint: step={_saved_curr_step}, "
                   f"seen_shards={len(_saved_seen_shards)}, "
+                  f"eval_history={len(_saved_eval_history)} pts, "
                   f"optimizer_state={'yes' if _saved_optimizer_state else 'no'}")
         else:
             state_dict = ckpt_obj
@@ -735,14 +761,72 @@ curr_step = _saved_curr_step
 seen_shards = set(_saved_seen_shards)
 final_loss = None
 last_grad_norm = None
-last_eval_loss = None
-eval_history = []
+last_eval_loss = _saved_last_eval_loss
+eval_history = list(_saved_eval_history)
 train_start = time.time()
 
-def _save_checkpoint():
+def _write_training_manifest(status="running", full_hash=False):
+    elapsed = time.time() - train_start
+    manifest = {
+        "stage": "training",
+        "status": status,
+        "created": datetime.datetime.now().isoformat(),
+        "checkpoint": file_info(CHECKPOINT_PATH, full_hash=full_hash),
+        "checkpoint_step": curr_step,
+        "tokenization_id": current_tok_id,
+        "config": {
+            "arch": "synapse_gpt_2b_d2560_l28",
+            "block_size": BLOCK_SIZE, "stride": STRIDE,
+            "embed_dim": EMBED_DIM, "num_layers": NUM_LAYERS,
+            "num_heads": NUM_HEADS, "num_kv_heads": NUM_KV_HEADS,
+            "ff_hidden_dim": FF_HIDDEN_DIM,
+            "rope_base": ROPE_BASE, "rmsnorm_eps": RMSNORM_EPS,
+            "gradient_checkpointing": GRAD_CHECKPOINT,
+            "vocab_size_raw": VOCAB_SIZE_RAW, "vocab_size_padded": VOCAB_SIZE,
+            "shard_dtype": str(SHARD_DTYPE),
+            "n_params": n_params, "n_trainable": n_trainable,
+            "batch_size": BATCH_SIZE, "grad_accum_steps": GRAD_ACCUM_STEPS,
+            "epochs": EPOCHS, "max_lr": MAX_LR, "min_lr": MIN_LR,
+            "warmup_steps": WARMUP_STEPS, "weight_decay": WEIGHT_DECAY,
+            "betas": list(BETAS), "grad_clip": GRAD_CLIP,
+            "precision": "bfloat16", "optimizer": "AdamW (fused)",
+            "lr_schedule": "cosine_with_warmup",
+        },
+        "data_selection": {
+            "max_tokens": MAX_TOKENS,
+            "data_mix": DATA_MIX,
+            "selected_shards": len(selected_shards),
+            "selected_tokens": selected_tokens,
+            "sources": dict(selected_by_source),
+            "eval_shards": len(eval_shards),
+            "eval_tokens": sum(s["tokens"] for s in eval_shards),
+        },
+        "results": {
+            "final_loss": final_loss,
+            "final_eval_loss": last_eval_loss,
+            "eval_history": eval_history,
+            "last_grad_norm": last_grad_norm,
+            "total_optimizer_steps": curr_step,
+            "lr_horizon_steps": LR_HORIZON_STEPS,
+            "total_hours": round(elapsed / 3600, 2),
+            "resumed_from": resume_path,
+        },
+    }
+    manifest_path = os.path.join(MANIFEST_DIR, "training_latest.json")
+    tmp_path = manifest_path + ".tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+    os.replace(tmp_path, manifest_path)
+    print(f"Manifest saved: {manifest_path} (status={status})")
+    _ckpt_remote = os.environ.get("CHECKPOINT_PUSH_REMOTE", "")
+    if _ckpt_remote.rstrip("/").endswith("/checkpoints"):
+        _manifest_remote = _ckpt_remote.rstrip("/")[: -len("/checkpoints")] + "/manifests"
+        _push_to_remote_async(manifest_path, _manifest_remote)
+
+def _save_checkpoint(final=False):
     # Bundle model + optimizer + step counter + seen-shards into one v2 file,
     # so a future resume can fully restore (model load + warm Adam + same LR
-    # schedule position + skip already-trained shards).
+    # schedule position + skip already-trained shards + eval curve).
     torch.save({
         "schema": "v2",
         "model": model.state_dict(),
@@ -750,8 +834,14 @@ def _save_checkpoint():
         "curr_step": curr_step,
         "seen_shards": sorted(seen_shards),
         "tokenization_id": current_tok_id,
+        "eval_history": eval_history,
+        "last_eval_loss": last_eval_loss,
     }, CHECKPOINT_PATH)
     _push_to_remote_async(CHECKPOINT_PATH, os.environ.get("CHECKPOINT_PUSH_REMOTE"))
+    _write_training_manifest(
+        status="completed" if final else "running",
+        full_hash=final,
+    )
 
 print("\nSTARTING TRAINING (BFloat16, GQA, RoPE, RMSNorm, grad-ckpt)\n")
 
@@ -847,65 +937,8 @@ for epoch in range(1, EPOCHS + 1):
 # ==================== 11. FINALIZE ====================
 total_time = time.time() - train_start
 print(f"Training Complete. {total_time/3600:.1f} hours, {curr_step} steps.")
-_save_checkpoint()
+_save_checkpoint(final=True)
 
-
-# ==================== 12. SAVE MANIFEST ====================
-manifest = {
-    "stage": "training",
-    "created": datetime.datetime.now().isoformat(),
-    "checkpoint": file_info(CHECKPOINT_PATH),
-    "tokenization_id": current_tok_id,
-    "config": {
-        "arch": "synapse_gpt_2b_d2560_l28",
-        "block_size": BLOCK_SIZE, "stride": STRIDE,
-        "embed_dim": EMBED_DIM, "num_layers": NUM_LAYERS,
-        "num_heads": NUM_HEADS, "num_kv_heads": NUM_KV_HEADS,
-        "ff_hidden_dim": FF_HIDDEN_DIM,
-        "rope_base": ROPE_BASE, "rmsnorm_eps": RMSNORM_EPS,
-        "gradient_checkpointing": GRAD_CHECKPOINT,
-        "vocab_size_raw": VOCAB_SIZE_RAW, "vocab_size_padded": VOCAB_SIZE,
-        "shard_dtype": str(SHARD_DTYPE),
-        "n_params": n_params, "n_trainable": n_trainable,
-        "batch_size": BATCH_SIZE, "grad_accum_steps": GRAD_ACCUM_STEPS,
-        "epochs": EPOCHS, "max_lr": MAX_LR, "min_lr": MIN_LR,
-        "warmup_steps": WARMUP_STEPS, "weight_decay": WEIGHT_DECAY,
-        "betas": list(BETAS), "grad_clip": GRAD_CLIP,
-        "precision": "bfloat16", "optimizer": "AdamW (fused)",
-        "lr_schedule": "cosine_with_warmup",
-    },
-    "data_selection": {
-        "max_tokens": MAX_TOKENS,
-        "data_mix": DATA_MIX,
-        "selected_shards": len(selected_shards),
-        "selected_tokens": selected_tokens,
-        "sources": dict(selected_by_source),
-        "eval_shards": len(eval_shards),
-        "eval_tokens": sum(s["tokens"] for s in eval_shards),
-    },
-    "results": {
-        "final_loss": final_loss,
-        "final_eval_loss": last_eval_loss,
-        "eval_history": eval_history,
-        "last_grad_norm": last_grad_norm,
-        "total_optimizer_steps": curr_step,
-        "lr_horizon_steps": LR_HORIZON_STEPS,
-        "total_hours": round(total_time / 3600, 2),
-        "resumed_from": resume_path,
-    },
-}
-manifest_path = os.path.join(MANIFEST_DIR, "training_latest.json")
-with open(manifest_path, "w") as f:
-    json.dump(manifest, f, indent=2)
-print(f"Manifest saved: {manifest_path}")
-
-# Mirror the manifest to the same Drive root the checkpoint goes to.
-# Convention: if CHECKPOINT_PUSH_REMOTE ends in "/checkpoints", push the
-# manifest to the sibling "/manifests" dir.
-_ckpt_remote = os.environ.get("CHECKPOINT_PUSH_REMOTE", "")
-if _ckpt_remote.rstrip("/").endswith("/checkpoints"):
-    _manifest_remote = _ckpt_remote.rstrip("/")[: -len("/checkpoints")] + "/manifests"
-    _push_to_remote_async(manifest_path, _manifest_remote)
 print(f"  tokenization_id: {current_tok_id}")
 print(f"  final_loss: {final_loss}")
 print(f"  final_eval_loss: {last_eval_loss}")
