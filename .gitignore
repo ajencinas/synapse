@@ -91,3 +91,6 @@ coverage.xml
 *.swp
 *.swo
 *~
+
+# Backup directories
+old_backup/
