@@ -691,7 +691,10 @@ def _write_training_manifest(status="running", full_hash=False):
             "data_mix": DATA_MIX,
             "selected_shards": len(selected_shards),
             "selected_tokens": selected_tokens,
-            "sources": dict(selected_by_source),
+            "sources": {
+                src: {**info, "unique": sorted(info["unique"])}
+                for src, info in selected_by_source.items()
+            },
             "eval_shards": len(eval_shards),
             "eval_tokens": sum(s["tokens"] for s in eval_shards),
         },
