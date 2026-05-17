@@ -149,6 +149,11 @@ BUCKET_EDGES     = [256, 512, 1024, 2048]
 EVAL_EVERY_STEPS = 100
 LATEST_SAVE_EVERY_STEPS = 200
 
+# Set DRY_RUN_STEPS=N to exit cleanly after N optimizer steps without eval/save
+# /generation — smoke test that setup, data loading, checkpoint load, forward,
+# backward, optimizer all work end-to-end. 0 = normal run.
+DRY_RUN_STEPS = int(os.environ.get("DRY_RUN_STEPS", "0"))
+
 # Special token IDs (must match tokenize_sft_data.py)
 PAD_ID = 1
 EOT_ID = 0
@@ -458,6 +463,8 @@ train_start = time.time()
 
 print("\n" + "=" * 60)
 print(f"STARTING SFT — {n_params/1e9:.2f}B params, bf16, grad-ckpt")
+if DRY_RUN_STEPS:
+    print(f"DRY RUN: will exit after {DRY_RUN_STEPS} optimizer steps, no eval/save/gen")
 print("=" * 60)
 
 model.train()
@@ -498,6 +505,19 @@ for epoch in range(1, EPOCHS + 1):
                 bktT=ids.size(1),
                 hrs=f"{elapsed/3600:.2f}",
             )
+
+            if DRY_RUN_STEPS and curr_step >= DRY_RUN_STEPS:
+                vram = torch.cuda.max_memory_allocated() / 1024**3
+                print(f"\n{'=' * 60}")
+                print(f"DRY RUN COMPLETE — {curr_step} optimizer steps in {elapsed:.1f}s")
+                print(f"  last step_loss: {step_loss:.4f}")
+                print(f"  last grad_norm: {float(grad_norm):.3f}")
+                print(f"  last bucket seq_len: {ids.size(1)}")
+                print(f"  peak VRAM: {vram:.2f} GB")
+                print(f"  est full-run wall time (per epoch): "
+                      f"{(elapsed/curr_step) * optimizer_steps_per_epoch / 60:.1f} min")
+                print(f"{'=' * 60}")
+                sys.exit(0)
 
             # Eval
             if curr_step % EVAL_EVERY_STEPS == 0:
