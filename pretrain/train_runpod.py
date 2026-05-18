@@ -126,10 +126,14 @@ def main():
         capture_output=True, text=True, timeout=30
     )
     if mf_exists.returncode == 0 and mf_exists.stdout.strip():
+        # Pull both training_latest.json and the eval pin (if present on Drive).
+        # The eval pin tells train.py which shards make up the held-out set;
+        # the launcher needs to know that list so it pulls those shards too.
         run(["rclone", "copy", MANIFEST_REMOTE, MANIFEST_LOCAL,
              "--include", "training_latest.json",
-             "--transfers", "1", "--checksum", "--progress"],
-            desc="pulling existing manifest", check=False)
+             "--include", "eval_shards.json",
+             "--transfers", "2", "--checksum", "--progress"],
+            desc="pulling existing manifest + eval pin", check=False)
     else:
         print("  no existing manifest found on Drive")
 
@@ -207,6 +211,21 @@ def main():
 
         selected_tokens = sum(s["tokens"] for s in selected_shards)
         print(f"\n[data] Selected {len(selected_shards)} shards ({selected_tokens:,} tokens)")
+
+        # Augment with pinned eval shards (if a pin exists) so train.py finds
+        # them locally. The pin lives in MANIFEST_LOCAL/eval_shards.json after
+        # the step-3 manifest pull above.
+        pin_path = os.path.join(MANIFEST_LOCAL, "eval_shards.json")
+        selected_names = {s["shard"] for s in selected_shards}
+        if os.path.exists(pin_path):
+            with open(pin_path) as f:
+                pin = json.load(f)
+            pinned_eval = [n for n in pin["shards"] if n not in selected_names]
+            if pinned_eval:
+                print(f"[data] Pin adds {len(pinned_eval)} eval shard(s) to pull list")
+                # Pull as raw filename entries that rclone --files-from can use.
+                extra_entries = [{"shard": n, "tokens": 0} for n in pinned_eval]
+                selected_shards = selected_shards + extra_entries
 
         # ── 6. Pull selected shards via rclone copy ──
         list_path = os.path.join(LOCAL_DIR, "selected_shards.txt")

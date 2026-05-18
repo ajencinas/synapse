@@ -558,17 +558,94 @@ for src, shards in sorted(shards_by_source.items()):
     src_tokens = sum(s["tokens"] for s in shards)
     print(f"  {src}: {len(shards)} shards, {src_tokens:,} tokens")
 
-eval_rng = random.Random(EVAL_SEED)
-eval_shards = []
-train_pool_by_source = {}
-for src, shards in shards_by_source.items():
-    pool = shards.copy()
-    eval_rng.shuffle(pool)
-    n_eval = max(1, int(len(pool) * EVAL_FRACTION_PER_SOURCE)) if len(pool) > 1 else 0
-    n_eval = min(n_eval, MAX_EVAL_SHARDS_PER_SOURCE)
-    eval_shards.extend(pool[:n_eval])
-    train_pool_by_source[src] = pool[n_eval:]
-print(f"\nHeld out {len(eval_shards)} eval shards "
+# Eval set is pinned in manifests/eval_shards.json so per-source losses stay
+# comparable across machines and restarts. Without the pin, the same seed
+# applied to a different local-shard subset picks different eval shards,
+# making per-source loss curves apples-to-oranges across resumes.
+#
+# First-ever run: select from the FULL shard manifest (deterministic across
+#   machines because shard_manifest.json is the same on Drive) and write the
+#   pin to disk + Drive.
+# Subsequent runs: load the pin, look up entries in the full manifest, and
+#   require each pinned shard to be locally present (fail loud if not — the
+#   launcher needs to pull them).
+# Set SYNAPSE_PIN_REGEN=1 to delete the pin and re-select.
+EVAL_PIN_PATH = os.path.join(MANIFEST_DIR, "eval_shards.json")
+
+if os.environ.get("SYNAPSE_PIN_REGEN") == "1" and os.path.exists(EVAL_PIN_PATH):
+    print(f"\nSYNAPSE_PIN_REGEN=1 — removing existing pin {EVAL_PIN_PATH}")
+    os.remove(EVAL_PIN_PATH)
+
+shards_by_source_full = defaultdict(list)
+for s in all_shards_raw:
+    shards_by_source_full[get_source_name(s)].append(s)
+
+if os.path.exists(EVAL_PIN_PATH):
+    with open(EVAL_PIN_PATH) as f:
+        pin = json.load(f)
+    pinned_names = pin["shards"]
+    print(f"\nUsing pinned eval set from {EVAL_PIN_PATH} ({len(pinned_names)} shards)")
+    by_name = {s["shard"]: s for s in all_shards_raw}
+    missing_from_manifest = [n for n in pinned_names if n not in by_name]
+    if missing_from_manifest:
+        raise RuntimeError(
+            f"pinned eval shards not found in shard_manifest.json: "
+            f"{missing_from_manifest[:5]}... — manifest changed since pinning"
+        )
+    eval_shards = [by_name[n] for n in pinned_names]
+    present_names = {s["shard"] for s in all_shards}
+    missing_locally = [n for n in pinned_names if n not in present_names]
+    if missing_locally:
+        raise RuntimeError(
+            f"{len(missing_locally)} pinned eval shard(s) missing locally "
+            f"(e.g. {missing_locally[:3]}). The launcher must pull them — "
+            f"or set SYNAPSE_PIN_REGEN=1 to drop the pin."
+        )
+else:
+    print(f"\nNo eval pin found — selecting fresh from full manifest")
+    _eval_rng = random.Random(EVAL_SEED)
+    eval_shards = []
+    for src, shards in shards_by_source_full.items():
+        pool = shards.copy()
+        _eval_rng.shuffle(pool)
+        n_eval = max(1, int(len(pool) * EVAL_FRACTION_PER_SOURCE)) if len(pool) > 1 else 0
+        n_eval = min(n_eval, MAX_EVAL_SHARDS_PER_SOURCE)
+        eval_shards.extend(pool[:n_eval])
+    pin_data = {
+        "tokenization_id": current_tok_id,
+        "eval_seed": EVAL_SEED,
+        "eval_fraction_per_source": EVAL_FRACTION_PER_SOURCE,
+        "max_eval_shards_per_source": MAX_EVAL_SHARDS_PER_SOURCE,
+        "shards": [s["shard"] for s in eval_shards],
+        "selected_from": "full_shard_manifest",
+    }
+    os.makedirs(MANIFEST_DIR, exist_ok=True)
+    _tmp = EVAL_PIN_PATH + ".tmp"
+    with open(_tmp, "w") as f:
+        json.dump(pin_data, f, indent=2)
+    os.replace(_tmp, EVAL_PIN_PATH)
+    print(f"  wrote pin: {EVAL_PIN_PATH}")
+    _ckpt_remote = os.environ.get("CHECKPOINT_PUSH_REMOTE", "").rstrip("/")
+    if _ckpt_remote.endswith("/checkpoints"):
+        _manifest_remote = _ckpt_remote[: -len("/checkpoints")] + "/manifests"
+        _push_to_remote_async(EVAL_PIN_PATH, _manifest_remote)
+    # Hard fail if any pinned shard isn't locally present (launcher needs to
+    # learn about the pin and pull them on next launch).
+    present_names = {s["shard"] for s in all_shards}
+    missing_locally = [s["shard"] for s in eval_shards if s["shard"] not in present_names]
+    if missing_locally:
+        raise RuntimeError(
+            f"{len(missing_locally)} freshly-pinned eval shard(s) not present "
+            f"locally (e.g. {missing_locally[:3]}). Re-run the launcher so it "
+            f"pulls the pin and the required eval shards."
+        )
+
+eval_pinned_names = {s["shard"] for s in eval_shards}
+train_pool_by_source = {
+    src: [s for s in shards if s["shard"] not in eval_pinned_names]
+    for src, shards in shards_by_source.items()
+}
+print(f"Held out {len(eval_shards)} eval shards "
       f"({sum(s['tokens'] for s in eval_shards):,} tokens)")
 
 random.seed(42)
