@@ -110,7 +110,10 @@ def main():
             run(["rclone", "copy",
                  CKPT_REMOTE, CKPT_LOCAL,
                  "--include", pick,
-                 "--transfers", "1", "--drive-chunk-size", "64M",
+                 "--transfers", "1",
+                 "--multi-thread-streams", "8",
+                 "--multi-thread-cutoff", "128M",
+                 "--drive-chunk-size", "128M",
                  "--progress", "--stats", "10s", "--stats-one-line"],
                 desc=f"pulling checkpoint ({pick})", check=False)
         else:
@@ -215,7 +218,9 @@ def main():
         t0 = time.time()
         run(["rclone", "copy", SHARD_REMOTE, SHARD_LOCAL,
              "--files-from", list_path,
-             "--transfers", "8", "--drive-chunk-size", "64M",
+             "--transfers", "16",
+             "--drive-chunk-size", "128M",
+             "--checkers", "16",
              "--checksum", "--progress"],
             desc="downloading selected shards")
         print(f"[data] Done in {time.time()-t0:.0f}s")
