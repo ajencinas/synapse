@@ -219,12 +219,11 @@ MAX_TOKENS = int(os.environ.get("MAX_TOKENS", 42_000_000_000))
 DATA_MIX = {
     "data_c4":                 0.40,
     "data_code":               0.20,
+    "data_finemath":           0.125,
     "data_arxiv":              0.10,
-    "data_finemath":           0.10,
     "data_wikipedia":          0.10,
     "data_books_gutemberg":    0.02,
     "data_math_operations":    0.005,
-    "data_math_operations_cot": 0.025,
     "data_code_math":          0.005,
     "data_distilled_facts":    0.01,
     "data_books_faded":        0.01,
