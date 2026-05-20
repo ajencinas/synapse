@@ -88,10 +88,14 @@ def main():
                 desc=f"pulling {f}")
 
     # ── 3. Pull existing checkpoint + manifest for resume (skip if remote dir empty) ──
-    ckpt_exists = subprocess.run(
-        ["rclone", "ls", CKPT_REMOTE, "--max-depth", "1"],
-        capture_output=True, text=True, timeout=30
-    )
+    try:
+        ckpt_exists = subprocess.run(
+            ["rclone", "ls", CKPT_REMOTE, "--max-depth", "1"],
+            capture_output=True, text=True, timeout=180,
+        )
+    except subprocess.TimeoutExpired:
+        print("  WARN: rclone ls (checkpoints) timed out; assuming none and continuing")
+        ckpt_exists = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="")
     if SKIP_RESUME:
         print("[resume] SKIP_RESUME=1 — skipping checkpoint pull (starting from scratch)")
         # Wipe local checkpoint dir to ensure fresh start
@@ -121,10 +125,14 @@ def main():
     else:
         print("  no existing checkpoint found on Drive")
 
-    mf_exists = subprocess.run(
-        ["rclone", "ls", MANIFEST_REMOTE, "--max-depth", "1"],
-        capture_output=True, text=True, timeout=30
-    )
+    try:
+        mf_exists = subprocess.run(
+            ["rclone", "ls", MANIFEST_REMOTE, "--max-depth", "1"],
+            capture_output=True, text=True, timeout=180,
+        )
+    except subprocess.TimeoutExpired:
+        print("  WARN: rclone ls (manifests) timed out; assuming none and continuing")
+        mf_exists = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="")
     if mf_exists.returncode == 0 and mf_exists.stdout.strip():
         # Pull both training_latest.json and the eval pin (if present on Drive).
         # The eval pin tells train.py which shards make up the held-out set;
