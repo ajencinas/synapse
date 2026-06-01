@@ -192,10 +192,11 @@ def main():
         # MUST stay in sync with pretrain/train.py:DATA_MIX. Until we consolidate
         # into a shared module, edit both files together. Mix sums to 1.000.
         DATA_MIX = {
-            "data_code":                   0.35,
-            "data_finemath":               0.18,
-            "data_arxiv":                  0.22,
-            "data_wikipedia":              0.15,
+            "data_code":                   0.15,
+            "data_finemath":               0.21,
+            "data_arxiv":                  0.21,
+            "data_wikipedia":              0.13,
+            "data_fineweb":                0.20,
             "data_math_operations_cot_v2": 0.025,
             "data_books_gutemberg":        0.02,
             "data_math_operations":        0.005,
