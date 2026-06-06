@@ -201,14 +201,15 @@ WEIGHT_DECAY     = 0.1
 WARMUP_STEPS     = 1000
 BETAS            = (0.9, 0.95)
 GRAD_CLIP        = 1.0
+# -- DATA SELECTION --
+MAX_TOKENS = int(os.environ.get("MAX_TOKENS", 42_000_000_000))
+
 # LR cosine horizon. Anchors the schedule to the LIFETIME training plan, not
 # to per-run shard selection — without this, curr_step (cumulative) overruns
 # the per-run-computed total_steps on every resume and LR collapses to MIN_LR.
-# 190_735 = 100B tokens / (BATCH_SIZE*GRAD_ACCUM_STEPS*BLOCK_SIZE).
-LR_HORIZON_STEPS = 190_735
-
-# -- DATA SELECTION --
-MAX_TOKENS = int(os.environ.get("MAX_TOKENS", 42_000_000_000))
+# Derived from MAX_TOKENS so the cosine fully decays to MIN_LR over the planned
+# run: MAX_TOKENS / (BATCH_SIZE*GRAD_ACCUM_STEPS*BLOCK_SIZE) ≈ 80,108 @ 42B tokens.
+LR_HORIZON_STEPS = MAX_TOKENS // (BATCH_SIZE * GRAD_ACCUM_STEPS * BLOCK_SIZE)
 
 # Each entry is either a plain float (= weight; trained for 1 epoch) or a dict
 # {"weight": w, "max_epochs": k} where the source's shards may be repeated up to
