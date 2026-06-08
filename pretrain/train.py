@@ -751,27 +751,16 @@ def _stage_shards_locally(src_dir, selected, evals):
     print(f"Staging done in {time.time()-t0:.0f}s.")
     return stage_dir
 
-SHARD_DIR = _stage_shards_locally(SHARD_DIR, selected_shards, eval_shards)
-
-
-# ==================== 8. LR SCHEDULE HORIZON ====================
+# ==================== 8. LR HORIZON, FRESH SELECTION, STAGING ====================
 # total_steps drives the cosine schedule and MUST be a lifetime constant
 # (LR_HORIZON_STEPS), not per-run. Otherwise curr_step (cumulative across
 # resumes) overruns this-run's-selection total and LR floors at MIN_LR.
 total_steps = LR_HORIZON_STEPS
-this_run_steps = (selected_tokens // BLOCK_SIZE // BATCH_SIZE * EPOCHS) // GRAD_ACCUM_STEPS
 
-print(f"  Effective Batch Size: {BATCH_SIZE * GRAD_ACCUM_STEPS} sequences "
-      f"({BATCH_SIZE * GRAD_ACCUM_STEPS * BLOCK_SIZE:,} tokens/step)")
-print(f"  LR horizon (lifetime): {total_steps:,} steps | Warmup: {WARMUP_STEPS} | "
-      f"resuming at step {_saved_curr_step:,} ({_saved_curr_step/total_steps:.1%} through)")
-print(f"  This run will add ~{this_run_steps:,} steps")
-print(f"  Mid-epoch save every {SAVE_EVERY_N_SHARDS} shards | Eval every {EVAL_EVERY_STEPS} steps")
-
-# Drop already-trained passes from the planned selection. seen_shards may
-# contain duplicates (one entry per pass), so subtract counts not membership:
-# if wikipedia shard X has 4 planned passes and 2 are already in seen_shards,
-# 2 remain in selected_shards.
+# Drop already-trained passes BEFORE staging, so only shards we'll actually
+# train get downloaded. seen_shards may contain duplicates (one entry per pass),
+# so subtract counts not membership: if wikipedia shard X has 4 planned passes
+# and 2 are already in seen_shards, 2 remain in selected_shards.
 if _saved_seen_shards:
     seen_counts = defaultdict(int)
     for name in _saved_seen_shards:
@@ -785,7 +774,44 @@ if _saved_seen_shards:
             remaining.append(s)
     selected_shards = remaining
     print(f"  Skipping {before - len(selected_shards)} already-trained shard-passes "
-          f"from prior run ({len(selected_shards)} remaining)")
+          f"from prior run ({len(selected_shards)} fresh remaining)")
+
+# Trim the fresh selection to just enough to reach the step target (cosine end)
+# plus a small margin. Training hard-stops at LR_HORIZON_STEPS regardless (see
+# loop), so staging/ingesting more than this is wasted download. Shuffle first so
+# the trimmed subset preserves DATA_MIX proportions instead of front-loaded
+# sources. MAX_TOKENS should be set large enough that the fresh remainder exceeds
+# this need; the trim then caps the actual download to ~what we train.
+TOKENS_PER_STEP = BATCH_SIZE * GRAD_ACCUM_STEPS * BLOCK_SIZE
+needed_tokens = max(0, int((LR_HORIZON_STEPS - _saved_curr_step) * TOKENS_PER_STEP * 1.05))
+if needed_tokens == 0:
+    print(f"  Already at/past LR horizon ({_saved_curr_step:,} >= {LR_HORIZON_STEPS:,}); "
+          f"nothing new to train.")
+    selected_shards = []
+elif sum(s["tokens"] for s in selected_shards) > needed_tokens:
+    random.shuffle(selected_shards)
+    trimmed, acc = [], 0
+    for s in selected_shards:
+        trimmed.append(s)
+        acc += s["tokens"]
+        if acc >= needed_tokens:
+            break
+    print(f"  Trimmed fresh selection to {len(trimmed)} shards (~{acc/1e9:.2f}B tok) "
+          f"to reach step {LR_HORIZON_STEPS:,} from {_saved_curr_step:,}")
+    selected_shards = trimmed
+
+selected_tokens = sum(s["tokens"] for s in selected_shards)
+this_run_steps = (selected_tokens // BLOCK_SIZE // BATCH_SIZE * EPOCHS) // GRAD_ACCUM_STEPS
+
+# Stage AFTER subtraction+trim: only the fresh shards we'll train (+ eval) hit disk.
+SHARD_DIR = _stage_shards_locally(SHARD_DIR, selected_shards, eval_shards)
+
+print(f"  Effective Batch Size: {BATCH_SIZE * GRAD_ACCUM_STEPS} sequences "
+      f"({TOKENS_PER_STEP:,} tokens/step)")
+print(f"  LR horizon (lifetime): {total_steps:,} steps | Warmup: {WARMUP_STEPS} | "
+      f"resuming at step {_saved_curr_step:,} ({_saved_curr_step/total_steps:.1%} through)")
+print(f"  This run will add ~{this_run_steps:,} steps (hard stop at step {LR_HORIZON_STEPS:,})")
+print(f"  Mid-epoch save every {SAVE_EVERY_N_SHARDS} shards | Eval every {EVAL_EVERY_STEPS} steps")
 
 
 # ==================== 9. EVAL HELPER ====================
@@ -843,7 +869,10 @@ def get_lr(it, total_it):
     return MIN_LR + coeff * (MAX_LR - MIN_LR)
 
 curr_step = _saved_curr_step
-seen_shards = set(_saved_seen_shards)
+# Multiset (list, one entry per training pass) — matches the resume subtraction
+# at section 8 which counts passes. A set here would collapse multi-epoch passes
+# to one, so max_epochs>1 sources would never converge across resumes.
+seen_shards = list(_saved_seen_shards)
 final_loss = None
 last_grad_norm = None
 last_eval_loss = _saved_last_eval_loss
@@ -933,6 +962,7 @@ def _save_checkpoint(final=False):
 
 print("\nSTARTING TRAINING (BFloat16, GQA, RoPE, RMSNorm, grad-ckpt)\n")
 
+stop_training = False
 for epoch in range(1, EPOCHS + 1):
     model.train()
     epoch_shards = selected_shards.copy()
@@ -965,6 +995,10 @@ for epoch in range(1, EPOCHS + 1):
                     desc=f"Ep {epoch} [{shard_idx+1}/{len(epoch_shards)}] {shard_source}/{shard_name}",
                     dynamic_ncols=True, mininterval=1.0)
 
+        # Accumulation window counter that resets per optimizer step (NOT per
+        # batch_idx) so the clean-break flush below knows the trailing count.
+        micro_in_window = 0
+        shard_completed = True
         for batch_idx, (xb, yb) in enumerate(pbar):
             lr = get_lr(curr_step, total_steps)
             for pg in optimizer.param_groups:
@@ -978,12 +1012,14 @@ for epoch in range(1, EPOCHS + 1):
                 loss = F.cross_entropy(logits.view(-1, VOCAB_SIZE), yb.view(-1))
                 loss = loss / GRAD_ACCUM_STEPS
             loss.backward()
+            micro_in_window += 1
 
-            if (batch_idx + 1) % GRAD_ACCUM_STEPS == 0:
+            if micro_in_window == GRAD_ACCUM_STEPS:
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
                 last_grad_norm = float(grad_norm)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+                micro_in_window = 0
                 curr_step += 1
                 final_loss = loss.item() * GRAD_ACCUM_STEPS
                 elapsed = time.time() - train_start
@@ -1009,15 +1045,51 @@ for epoch in range(1, EPOCHS + 1):
                     print(f"  [eval @ step {curr_step}] overall={last_eval_loss:.3f} | "
                           f"{per_src} (train={final_loss:.3f}, gnorm={last_grad_norm:.2f})")
 
-        del tokens, dataset, loader
-        seen_shards.add(shard_name)
+                # Hard stop at the cosine end so we land on LR_HORIZON_STEPS
+                # rather than overshooting into the flat-MIN_LR tail. This shard
+                # is left mid-consumed, so it is NOT marked seen (see below).
+                if curr_step >= total_steps:
+                    shard_completed = False
+                    stop_training = True
+                    break
 
-        if (shard_idx + 1) % SAVE_EVERY_N_SHARDS == 0:
+        # Clean break at the shard boundary: flush the trailing partial window so
+        # this shard's leftover micro-batches form their OWN step instead of
+        # contaminating the next shard's first window. The grads were divided by
+        # GRAD_ACCUM_STEPS but only `micro_in_window` of them accumulated, so
+        # rescale to the true mean over the partial window before clipping.
+        if micro_in_window > 0:
+            scale = GRAD_ACCUM_STEPS / micro_in_window
+            for p in model.parameters():
+                if p.grad is not None:
+                    p.grad.mul_(scale)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+            last_grad_norm = float(grad_norm)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            curr_step += 1
+            final_loss = loss.item() * GRAD_ACCUM_STEPS
+            if curr_step >= total_steps:
+                stop_training = True
+
+        del tokens, dataset, loader
+        # Only record a pass once the shard is fully consumed; a step-stopped
+        # partial shard stays unseen so it can be picked up on a later resume.
+        if shard_completed:
+            seen_shards.append(shard_name)
+
+        if (shard_idx + 1) % SAVE_EVERY_N_SHARDS == 0 or stop_training:
             elapsed = time.time() - train_start
             print(f"  Mid-epoch save at shard {shard_idx+1}/{len(epoch_shards)} "
                   f"(step {curr_step}, loss {final_loss:.3f}, {elapsed/3600:.1f}h elapsed)...")
             _save_checkpoint()
 
+        if stop_training:
+            print(f"  Reached LR horizon ({curr_step:,} >= {total_steps:,}) — stopping.")
+            break
+
+    if stop_training:
+        break
     print(f"Saving Epoch {epoch}...")
     _save_checkpoint()
 
