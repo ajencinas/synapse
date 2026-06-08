@@ -10,7 +10,10 @@ Environment variables (all optional):
   GDRIVE_REMOTE       rclone remote name (default: gdrive)
   GDRIVE_PATH         Base path on Drive (default: synapse)
   LOCAL_DIR           Local working directory (default: /workspace/synapse_data)
-  MAX_TOKENS          Token budget (default: 5_000_000_000 ≈ ~10 GB)
+  MAX_TOKENS          Selection budget pre seen-subtraction (default:
+                      70_000_000_000). Sized so the FRESH remainder exceeds the
+                      ~25B needed to reach train.py's LR_HORIZON_STEPS (120k);
+                      the launcher then pulls only that fresh, trimmed set.
   CHECKPOINT_NAME     Checkpoint filename
   SKIP_DATA_PULL      If "1", skip pulling shards (use existing local)
 """
@@ -25,7 +28,7 @@ from collections import defaultdict
 GDRIVE_REMOTE = os.environ.get("GDRIVE_REMOTE", "gdrive")
 GDRIVE_PATH = os.environ.get("GDRIVE_PATH", "synapse")
 LOCAL_DIR = os.environ.get("LOCAL_DIR", "/workspace/synapse_data")
-DEFAULT_TOKEN_BUDGET = 5_000_000_000
+DEFAULT_TOKEN_BUDGET = 70_000_000_000
 TOKEN_BUDGET = int(os.environ.get("MAX_TOKENS", os.environ.get("TOKEN_BUDGET", str(DEFAULT_TOKEN_BUDGET))))
 SKIP_DATA_PULL = os.environ.get("SKIP_DATA_PULL", "0") == "1"
 SKIP_RESUME = os.environ.get("SKIP_RESUME", "0") == "1"
@@ -158,6 +161,25 @@ def main():
         sys.exit(1)
     print("  Python deps: OK")
 
+    # ── Read seen_shards (multiset) + step from the pulled checkpoint so the
+    # selection below can drop already-trained shards and pull ONLY fresh ones.
+    # mmap=True keeps the 25 GB of weights off the heap; we only touch the list.
+    seen_passes = []
+    saved_curr_step = 0
+    ckpt_name = os.environ.get("CHECKPOINT_NAME", "synapse_2b_d2560_l28.pth")
+    ckpt_path = os.path.join(CKPT_LOCAL, ckpt_name)
+    if not SKIP_RESUME and os.path.exists(ckpt_path):
+        try:
+            import torch
+            _ck = torch.load(ckpt_path, map_location="cpu", mmap=True, weights_only=False)
+            if isinstance(_ck, dict) and _ck.get("schema") == "v2":
+                seen_passes = list(_ck.get("seen_shards", []))
+                saved_curr_step = int(_ck.get("curr_step", 0))
+            del _ck
+            print(f"  checkpoint: curr_step={saved_curr_step:,}, seen_shards={len(seen_passes)}")
+        except Exception as e:
+            print(f"  WARN: could not read seen_shards ({e}); pulling full plan")
+
     # ── 5. Select shards matching train.py's DATA_MIX ──
     if SKIP_DATA_PULL:
         print("[data] SKIP_DATA_PULL=1 — skipping shard pull, using existing local")
@@ -223,7 +245,53 @@ def main():
                 running += s["tokens"]
 
         selected_tokens = sum(s["tokens"] for s in selected_shards)
-        print(f"\n[data] Selected {len(selected_shards)} shards ({selected_tokens:,} tokens)")
+        print(f"\n[data] Selected {len(selected_shards)} shard-passes ({selected_tokens:,} tokens)")
+
+        # Drop already-trained passes (count-based; matches train.py section 8) so
+        # only fresh shards get pulled.
+        if seen_passes:
+            seen_counts = defaultdict(int)
+            for n in seen_passes:
+                seen_counts[n] += 1
+            before = len(selected_shards)
+            remaining = []
+            for s in selected_shards:
+                if seen_counts[s["shard"]] > 0:
+                    seen_counts[s["shard"]] -= 1
+                else:
+                    remaining.append(s)
+            selected_shards = remaining
+            print(f"[data] Skipping {before - len(selected_shards)} already-trained "
+                  f"shard-passes ({len(selected_shards)} fresh remaining)")
+
+        # Trim to the tokens needed to reach the LR horizon (+5% margin) so the
+        # pull is ~what we train, not the whole plan. These constants MUST match
+        # pretrain/train.py (LR_HORIZON_STEPS and BATCH_SIZE*GRAD_ACCUM_STEPS*
+        # BLOCK_SIZE). train.py re-applies the same trim, so pulling a hair extra
+        # is harmless; pulling too little would stop the run short of the horizon.
+        LR_HORIZON_STEPS = 120_000
+        TOKENS_PER_STEP = 4 * 64 * 2048
+        needed = max(0, int((LR_HORIZON_STEPS - saved_curr_step) * TOKENS_PER_STEP * 1.05))
+        fresh_tok = sum(s["tokens"] for s in selected_shards)
+        if needed == 0:
+            print(f"[data] Already at/past LR horizon ({saved_curr_step:,} >= "
+                  f"{LR_HORIZON_STEPS:,}); nothing fresh to pull.")
+            selected_shards = []
+        elif fresh_tok > needed:
+            random.shuffle(selected_shards)
+            trimmed, acc = [], 0
+            for s in selected_shards:
+                trimmed.append(s)
+                acc += s["tokens"]
+                if acc >= needed:
+                    break
+            print(f"[data] Trimmed to {len(trimmed)} fresh shards (~{acc/1e9:.2f}B tok) "
+                  f"to reach step {LR_HORIZON_STEPS:,} from {saved_curr_step:,}")
+            selected_shards = trimmed
+        else:
+            print(f"[data] Fresh remainder {fresh_tok/1e9:.2f}B < needed "
+                  f"{needed/1e9:.2f}B; pulling all fresh (may stop short of "
+                  f"{LR_HORIZON_STEPS:,} — raise MAX_TOKENS).")
 
         # Augment with pinned eval shards (if a pin exists) so train.py finds
         # them locally. The pin lives in MANIFEST_LOCAL/eval_shards.json after
