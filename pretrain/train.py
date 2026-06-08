@@ -204,12 +204,14 @@ GRAD_CLIP        = 1.0
 # -- DATA SELECTION --
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", 42_000_000_000))
 
-# LR cosine horizon. Anchors the schedule to the LIFETIME training plan, not
-# to per-run shard selection — without this, curr_step (cumulative) overruns
-# the per-run-computed total_steps on every resume and LR collapses to MIN_LR.
-# Derived from MAX_TOKENS so the cosine fully decays to MIN_LR over the planned
-# run: MAX_TOKENS / (BATCH_SIZE*GRAD_ACCUM_STEPS*BLOCK_SIZE) ≈ 80,108 @ 42B tokens.
-LR_HORIZON_STEPS = MAX_TOKENS // (BATCH_SIZE * GRAD_ACCUM_STEPS * BLOCK_SIZE)
+# LR cosine horizon. Fixed schedule target, deliberately DECOUPLED from
+# MAX_TOKENS (the per-run data budget) — curr_step is cumulative across resumes,
+# so this is the step at which the cosine reaches MIN_LR. Set to 120k, above the
+# ~80k we expect to finish near: this keeps a non-trivial LR through the final
+# fresh-data run (~42% -> ~32% of peak across steps 71.9k -> 80.6k) and leaves
+# headroom to train further without the schedule flooring at MIN_LR. It must be
+# a lifetime constant, not per-run, or curr_step overruns it and LR collapses.
+LR_HORIZON_STEPS = 120_000
 
 # Each entry is either a plain float (= weight; trained for 1 epoch) or a dict
 # {"weight": w, "max_epochs": k} where the source's shards may be repeated up to
