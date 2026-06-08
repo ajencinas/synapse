@@ -5,7 +5,9 @@ Configurable via environment variables (all optional):
   SYNAPSE_DIR             Base dir holding token_shards_merged/, checkpoints/, manifests/.
                           Default: /content/drive/MyDrive/synapse on Colab, ./synapse elsewhere.
   CHECKPOINT_NAME         Checkpoint filename. Default: synapse_2b_d2560_l28.pth.
-  MAX_TOKENS              Token budget. Default: 42_000_000_000.
+  MAX_TOKENS              Token budget (selection size, pre seen-subtraction).
+                          Default: 70_000_000_000 — sized so the fresh remainder
+                          exceeds the ~25B needed to reach LR_HORIZON_STEPS (120k).
   EXPECTED_TOK_ID         Required tokenization_id. Default: 7a570a7ba9fc7985.
   SKIP_DRIVE_MOUNT        If "1", don't try to mount Google Drive even on Colab.
   CHECKPOINT_PUSH_REMOTE  Optional rclone remote dir, e.g. "gdrive:synapse/checkpoints".
@@ -202,7 +204,7 @@ WARMUP_STEPS     = 1000
 BETAS            = (0.9, 0.95)
 GRAD_CLIP        = 1.0
 # -- DATA SELECTION --
-MAX_TOKENS = int(os.environ.get("MAX_TOKENS", 42_000_000_000))
+MAX_TOKENS = int(os.environ.get("MAX_TOKENS", 70_000_000_000))
 
 # LR cosine horizon. Fixed schedule target, deliberately DECOUPLED from
 # MAX_TOKENS (the per-run data budget) — curr_step is cumulative across resumes,
