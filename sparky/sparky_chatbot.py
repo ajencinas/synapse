@@ -244,6 +244,7 @@ HTML_PAGE = r'''
             </select></label>
             <button id="new-chat-btn">New Chat</button>
             <label title="SFT only: canonical tool prompt + python sandbox"><input type="checkbox" id="tools-toggle" checked> Tools (python)</label>
+            <label title="Speak each reply aloud, then reopen the mic"><input type="checkbox" id="voice-mode"> 🎧 Voice</label>
             <label>Temp: <span id="temp-value">0.8</span> <input type="range" id="temperature" min="0.1" max="2.0" step="0.05" value="0.8"></label>
             <label>Max Tokens: <input type="number" id="max-tokens" min="10" max="1024" value="128"></label>
             <label>Top-K: <input type="number" id="top-k" min="1" max="200" value="50"></label>
@@ -345,7 +346,7 @@ HTML_PAGE = r'''
             return out;
         }
 
-        function speakText(text, btn) {
+        function speakText(text, btn, onDone) {
             if (!text) return;
             if (activeSpeakBtn === btn) { stopSpeaking(); return; }   // toggle off
             stopSpeaking();
@@ -366,6 +367,7 @@ HTML_PAGE = r'''
                 btn.textContent = '🔊';
                 stopKeepAlive();
                 if (activeSpeakBtn === btn) activeSpeakBtn = null;
+                if (onDone) onDone();
             };
             // There is no single utterance-end for a queued batch, so poll.
             startKeepAlive();
@@ -543,8 +545,19 @@ HTML_PAGE = r'''
                                 if (data.done) {
                                     cursor.remove();
                                     newTurns = data.messages || null;
+                                    // responseText resets at each tool block, so this is
+                                    // ONLY the final answer — never code or snippets.
                                     const spoken = responseText;
-                                    if (spoken) attachSpeakButton(assistantMsg, () => spoken);
+                                    if (spoken) {
+                                        const sBtn = attachSpeakButton(assistantMsg, () => spoken);
+                                        if (document.getElementById('voice-mode').checked && data.status !== 'error') {
+                                            speakText(spoken, sBtn, () => {
+                                                // re-check at hand-off so unticking mid-speech stops the loop
+                                                if (document.getElementById('voice-mode').checked
+                                                        && recognition && !listening) startListening();
+                                            });
+                                        }
+                                    }
                                 }
                             } catch (e) {}
                         }
