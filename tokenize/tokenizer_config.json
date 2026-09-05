@@ -1,0 +1,45 @@
+{
+  "_comment": "Tokenizer pipeline config. Edit this file to tune the run. The notebook loads this verbatim into the manifest for full reproducibility.",
+
+  "vocab_size": 64000,
+  "min_frequency": 2,
+  "bpe_dropout": null,
+  "train_subset_bytes": 4294967296,
+  "encode_batch_size": 500,
+  "read_chunk_characters": 8388608,
+  "shard_dtype": "uint16",
+
+  "num_special_tokens": 256,
+  "named_special_tokens": [
+    "<|endoftext|>",
+    "<|pad|>",
+    "<|im_start|>",
+    "<|im_end|>",
+    "<|fim_prefix|>",
+    "<|fim_middle|>",
+    "<|fim_suffix|>",
+    "<|tool_call|>",
+    "<|tool_result|>"
+  ],
+  "eot_token": "<|endoftext|>",
+  "pad_token": "<|pad|>",
+
+  "eval": {
+    "_comment": "Auto-gate after training. Pipeline aborts (raises RuntimeError) if any threshold fails, so bad tokenizers never waste GPU hours on sharding. All checks must pass silently for the run to proceed.",
+    "held_out_fraction": 0.05,
+    "max_eval_bytes": 52428800,
+    "seed": 43,
+    "thresholds": {
+      "chars_per_token_min": 3.0,
+      "chars_per_token_max": 6.0,
+      "bytes_per_token_min": 2.5,
+      "max_single_token_freq": 0.10
+    }
+  },
+
+  "merge": {
+    "_comment": "After tokenization, stream-concatenate consecutive shards within each domain into ~target_bytes buckets so trainer shards are uniform. Order is preserved. Output dir = SHARD_DIR + '_merged'. Disable with --no-merge or enabled=false.",
+    "enabled": true,
+    "target_bytes": 104857600
+  }
+}

@@ -1,0 +1,68 @@
+// SFT data flow for SynapseGPT. Render:
+//   dot -Tpng sft/SFT_DATA_FLOW.dot -o sft/SFT_DATA_FLOW.png
+//   dot -Tsvg sft/SFT_DATA_FLOW.dot -o sft/SFT_DATA_FLOW.svg
+digraph SFT {
+  rankdir=TB;
+  fontname="Helvetica"; bgcolor="white";
+  node [fontname="Helvetica", fontsize=11, style="filled,rounded", shape=box];
+  edge [fontname="Helvetica", fontsize=9, color="#555555"];
+
+  // status palette
+  // green = on Drive, blue = new (ready, not run), orange = in progress
+  node [fillcolor="#e8f0fe"];
+
+  subgraph cluster_ots {
+    label="OTS download  ·  sft_data_prep.ipynb → download_sft_data.py";
+    labCol="#1a73e8"; color="#9bb8e8"; style="rounded"; fontcolor="#1a73e8"; fontsize=12;
+    tulu3 [fillcolor="#d7ecd9"]; oasst1 [fillcolor="#d7ecd9"]; dolly [fillcolor="#d7ecd9"];
+    metamath [fillcolor="#d7ecd9"]; opencode [fillcolor="#d7ecd9"]; samsum [fillcolor="#d7ecd9"];
+    alpaca_gpt4 [fillcolor="#d7ecd9"];
+    no_robots [label="no_robots\n(NEW)", fillcolor="#cfe2ff"];
+  }
+
+  subgraph cluster_custom {
+    label="Custom generation  ·  DeepSeek V4 Flash teacher";
+    color="#e8b59b"; style="rounded"; fontcolor="#b5530a"; fontsize=12;
+    rd  [label="reasoning_distill\ngenerate_reasoning_distill.py\n(26,250 verified)", fillcolor="#d7ecd9"];
+    tu  [label="tool_use\ngenerate_tool_use.py\npython + search/facts", fillcolor="#ffe0b3"];
+    cr  [label="creative\ngenerate_creative.py\nteacher + LLM-judge (NEW)", fillcolor="#cfe2ff"];
+    facts [label="Wikidata fact DB\ngenerate_tool_problems.py", shape=cylinder, fillcolor="#f3e8ff"];
+    rt  [label="tools_runtime.py\nsandbox + Brave + tokenizer", shape=note, fillcolor="#fff4cc"];
+  }
+
+  dl [label="download_sft_data.py\n(decontaminate + normalize)", fillcolor="#eeeeee"];
+
+  raw  [label="datasets_sft/<name>/<name>_raw.jsonl\n{system, messages:[...]}  ·  Google Drive", shape=cylinder, fillcolor="#eaf3ff"];
+  tok  [label="tokenize_sft_data.py\nChatML, tool tokens 7/8, loss mask, ≤2048", fillcolor="#eeeeee"];
+  shards [label="sft_tokenized/<name>/{train,val}.jsonl", shape=cylinder, fillcolor="#eaf3ff"];
+  con  [label="consolidate_sft_data.py", fillcolor="#eeeeee"];
+  reg  [label="manifests/sft_data_registry.json", shape=cylinder, fillcolor="#eaf3ff"];
+  mix  [label="sft.py · SFT_DATA_MIX\nweighted per-batch sampling", fillcolor="#eeeeee"];
+  train [label="sft_pre_train.ipynb\ntrain SynapseGPT (~2B)", shape=box3d, fillcolor="#ffd9d9"];
+
+  // OTS -> downloader -> raw
+  {tulu3 oasst1 dolly metamath opencode samsum alpaca_gpt4 no_robots} -> dl [color="#9bb8e8"];
+  dl -> raw;
+
+  // custom helpers feed tool_use
+  facts -> tu [label="facts pool", style=dashed, color="#9b59b6"];
+  rt -> tu [style=dashed, color="#b58900"];
+
+  // custom generators -> raw
+  rd -> raw; tu -> raw; cr -> raw;
+
+  // pipeline
+  raw -> tok -> shards -> con -> reg -> mix -> train;
+
+  // shared runtime also used at inference (note)
+  rt -> train [label="same tools at inference\n(sparky_chatbot tool-loop, TODO)", style=dotted, color="#b58900", constraint=false];
+
+  // legend
+  subgraph cluster_legend {
+    label="Legend"; color="#cccccc"; fontsize=11;
+    l_done [label="on Drive", fillcolor="#d7ecd9", shape=box];
+    l_new  [label="new / ready", fillcolor="#cfe2ff", shape=box];
+    l_prog [label="in progress", fillcolor="#ffe0b3", shape=box];
+    l_done -> l_new -> l_prog [style=invis];
+  }
+}

@@ -1,0 +1,985 @@
+#!/usr/bin/env python3
+"""SynapseGPT pretraining — runs in Colab or on a bare VM (Lambda, GCP, etc.).
+
+Configurable via environment variables (all optional):
+  SYNAPSE_DIR             Base dir holding token_shards_merged/, checkpoints/, manifests/.
+                          Default: /content/drive/MyDrive/synapse on Colab, ./synapse elsewhere.
+  CHECKPOINT_NAME         Checkpoint filename. Default: synapse_2b_d2560_l28.pth.
+  MAX_TOKENS              Token budget (selection size, pre seen-subtraction).
+                          Default: 70_000_000_000 — sized so the fresh remainder
+                          exceeds the ~25B needed to reach LR_HORIZON_STEPS (120k).
+  EXPECTED_TOK_ID         Required tokenization_id. Default: 7a570a7ba9fc7985.
+  SKIP_DRIVE_MOUNT        If "1", don't try to mount Google Drive even on Colab.
+  CHECKPOINT_PUSH_REMOTE  Optional rclone remote dir, e.g. "gdrive:synapse/checkpoints".
+                          If set, every checkpoint save is pushed there in a background
+                          thread (used on Lambda/RunPod where local SSD is ephemeral).
+
+Checkpoint schema (auto-detected on load):
+  v2 (dict):  {"schema":"v2", "model", "optimizer", "curr_step", "seen_shards", ...}
+  legacy:     a plain torch.nn.Module state_dict (model weights only).
+Loading legacy works fine; optimizer + step counter start fresh and shards
+already trained will appear in the next selection. Every save from here on
+writes v2, so subsequent restarts are fully clean.
+"""
+import os
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+import json
+import hashlib
+import random
+import math
+import time
+import shutil
+import datetime
+import logging
+import subprocess
+import threading
+from collections import defaultdict
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torch.utils.checkpoint import checkpoint
+from tqdm import tqdm
+
+torch._logging.set_logs(inductor=logging.WARNING, dynamic=logging.WARNING)
+logging.getLogger("torch._inductor").setLevel(logging.WARNING)
+
+import sys as _sys
+# Shared model = single source of truth (sft/SFT_TRAIN_PLAN.md §0.1). Add the
+# script dir and its parent so `import synapse_model` resolves whether train.py
+# was cloned (lives in pretrain/) or downloaded flat next to it (/content).
+for _p in (os.path.dirname(os.path.abspath(__file__)),
+           os.path.dirname(os.path.dirname(os.path.abspath(__file__)))):
+    if _p not in _sys.path:
+        _sys.path.insert(0, _p)
+from synapse_model import (
+    in_colab, maybe_mount_drive, default_synapse_dir,
+    RMSNorm, precompute_rope, apply_rope, CausalGQA, SwiGLU,
+    TransformerBlock, SynapseGPT,
+    BLOCK_SIZE, EMBED_DIM, NUM_LAYERS, NUM_HEADS, NUM_KV_HEADS,
+    FF_HIDDEN_DIM, ROPE_BASE, RMSNORM_EPS, GRAD_CHECKPOINT,
+)
+
+
+# ==================== 1. ENVIRONMENT SETUP ====================
+# in_colab / maybe_mount_drive / default_synapse_dir imported from synapse_model.
+
+
+# ==================== 2. MANIFEST HELPERS ====================
+def file_hash(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(8192):
+            h.update(chunk)
+    return h.hexdigest()
+
+def partial_file_hash(path, edge=1 << 20):
+    # Hash first + last `edge` bytes and mix in total size. Bounded I/O regardless
+    # of file size — fine as a change-detector / partial-upload check for the
+    # manifest, NOT a tamper-proof integrity hash. torch.save's zip layout puts
+    # the central directory at the tail, so any tensor change shifts those bytes.
+    size = os.path.getsize(path)
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        h.update(f.read(min(edge, size)))
+        if size > 2 * edge:
+            f.seek(-edge, 2)
+            h.update(f.read(edge))
+    h.update(size.to_bytes(8, "little"))
+    return h.hexdigest()
+
+def file_info(path, *, full_hash=False):
+    if not os.path.exists(path):
+        return {"path": path, "exists": False}
+    size = os.path.getsize(path)
+    info = {
+        "path": path,
+        "size_mb": round(size / 1024 / 1024, 2),
+        "size_bytes": size,
+    }
+    if full_hash:
+        info["sha256"] = file_hash(path)
+    else:
+        info["sha256_partial"] = partial_file_hash(path)
+    return info
+
+def filter_present_shards(shards, shard_dir, dtype_bytes):
+    # Drop manifest entries whose .bin is absent or wrong-size; lets training
+    # start while rclone is still mid-upload. Wrong-size catches partial files.
+    kept, missing, wrong_size = [], [], []
+    for s in shards:
+        path = os.path.join(shard_dir, s["shard"])
+        if not os.path.exists(path):
+            missing.append(s)
+            continue
+        if os.path.getsize(path) != s["tokens"] * dtype_bytes:
+            wrong_size.append(s)
+            continue
+        kept.append(s)
+    return kept, missing, wrong_size
+
+def _push_to_remote_async(local_path, remote_dir):
+    # Fire-and-forget rclone copy. Used on VMs where the trainer writes to
+    # local SSD but we need durable copies on Drive in case the box dies.
+    # Failures are logged but don't crash training - the next save retries.
+    if not remote_dir:
+        return
+    remote_path = remote_dir.rstrip("/") + "/" + os.path.basename(local_path)
+    def _run():
+        try:
+            r = subprocess.run(
+                ["rclone", "copyto", local_path, remote_path,
+                 "--checksum", "--drive-chunk-size=64M"],
+                capture_output=True, text=True, timeout=3600,
+            )
+            if r.returncode == 0:
+                print(f"  pushed {os.path.basename(local_path)} -> {remote_dir}")
+            else:
+                print(f"  WARNING: rclone push failed for "
+                      f"{os.path.basename(local_path)}: {r.stderr.strip()[:200]}")
+        except Exception as e:
+            print(f"  WARNING: rclone push exception: {e}")
+    threading.Thread(target=_run, daemon=True).start()
+
+
+# ==================== 3. CONFIGURATION ====================
+maybe_mount_drive()
+
+SYNAPSE = os.environ.get("SYNAPSE_DIR") or default_synapse_dir()
+SHARD_DIR = os.path.join(SYNAPSE, "token_shards_merged")
+CHECKPOINT_DIR = os.path.join(SYNAPSE, "checkpoints")
+MANIFEST_DIR = os.path.join(SYNAPSE, "manifests")
+TOKENIZER_PATH = os.path.join(SYNAPSE, "tokenizer_out", "tokenizer.json")
+os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+os.makedirs(MANIFEST_DIR, exist_ok=True)
+
+CHECKPOINT_NAME = os.environ.get("CHECKPOINT_NAME", "synapse_2b_d2560_l28.pth")
+CHECKPOINT_PATH = os.path.join(CHECKPOINT_DIR, CHECKPOINT_NAME)
+
+if not os.path.isdir(SHARD_DIR):
+    raise FileNotFoundError(
+        f"Token shards not found at {SHARD_DIR}. "
+        f"Set SYNAPSE_DIR to point at the synapse data root."
+    )
+
+# Archive old checkpoint if it exists
+if os.path.exists(CHECKPOINT_PATH):
+    mod_time = os.path.getmtime(CHECKPOINT_PATH)
+    date_str = datetime.datetime.fromtimestamp(mod_time).strftime("%Y%m%d_%H%M%S")
+    archived_name = CHECKPOINT_NAME.replace(".pth", f"_{date_str}.pth")
+    archived_path = os.path.join(CHECKPOINT_DIR, archived_name)
+    if not os.path.exists(archived_path):
+        shutil.copy2(CHECKPOINT_PATH, archived_path)
+        print(f"Archived old checkpoint as: {archived_name}")
+
+# -- MODEL ARCHITECTURE (Shape D, ~2.1B params) --
+# Architecture constants (BLOCK_SIZE, EMBED_DIM, ...) imported from synapse_model.
+# STRIDE is pretrain-only (sliding window over the token stream).
+STRIDE          = BLOCK_SIZE
+
+# -- TRAINING HYPERPARAMETERS --
+BATCH_SIZE       = 4
+GRAD_ACCUM_STEPS = 64           # effective batch = 256 sequences = 524K tokens/step
+EPOCHS           = 1
+MAX_LR           = 3e-4
+MIN_LR           = 3e-5
+WEIGHT_DECAY     = 0.1
+WARMUP_STEPS     = 1000
+BETAS            = (0.9, 0.95)
+GRAD_CLIP        = 1.0
+# -- DATA SELECTION --
+MAX_TOKENS = int(os.environ.get("MAX_TOKENS", 70_000_000_000))
+
+# LR cosine horizon. Fixed schedule target, deliberately DECOUPLED from
+# MAX_TOKENS (the per-run data budget) — curr_step is cumulative across resumes,
+# so this is the step at which the cosine reaches MIN_LR. Set to 120k, above the
+# ~80k we expect to finish near: this keeps a non-trivial LR through the final
+# fresh-data run (~42% -> ~32% of peak across steps 71.9k -> 80.6k) and leaves
+# headroom to train further without the schedule flooring at MIN_LR. It must be
+# a lifetime constant, not per-run, or curr_step overruns it and LR collapses.
+LR_HORIZON_STEPS = 120_000
+
+# Each entry is either a plain float (= weight; trained for 1 epoch) or a dict
+# {"weight": w, "max_epochs": k} where the source's shards may be repeated up to
+# k times to fill its w*MAX_TOKENS budget. Single-epoch run across all sources;
+# supply-constrained sources will simply hit their token cap before the weight
+# budget is filled. Code dominates for reasoning signal; arxiv/finemath/wiki
+# carry technical and encyclopedic text. Filtered web (fineweb) reintroduces a
+# general-web generalization signal; raw web (c4) remains excluded from training
+# but kept in the eval pin as a held-out signal.
+DATA_MIX = {
+    "data_code":                  0.15,
+    "data_finemath":              0.21,
+    "data_arxiv":                 0.21,
+    "data_wikipedia":             0.13,
+    "data_fineweb":               0.20,
+    "data_math_operations_cot_v2": 0.025,
+    "data_books_gutemberg":       0.02,
+    "data_math_operations":       0.005,
+    "data_code_math":             0.005,
+    "data_distilled_facts":       0.01,
+    "data_books_faded":           0.01,
+    "data_math_text":             0.005,
+    "data_math_text_v2":          0.01,
+    "data_adult":                 0.01,
+}
+
+# -- EVAL --
+EVAL_FRACTION_PER_SOURCE   = 0.02
+MAX_EVAL_SHARDS_PER_SOURCE = 5     # cap so abundant sources (code, c4) don't dominate eval
+EVAL_EVERY_STEPS           = 500
+EVAL_BATCHES               = 32    # per source — total eval work ~= 32 * num_sources
+EVAL_SEED                  = 1337
+
+# -- MID-EPOCH CHECKPOINT --
+SAVE_EVERY_N_SHARDS = 2
+
+# Hardware Settings
+torch.set_float32_matmul_precision('high')
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if device.type == 'cuda':
+    props = torch.cuda.get_device_properties(0)
+    print(f"GPU: {props.name} | VRAM: {props.total_memory / 1024**3:.1f} GB")
+else:
+    print("WARNING: no CUDA device found — training on CPU will be unusably slow.")
+
+
+# ==================== 4. MODEL DEFINITION ====================
+# RMSNorm, precompute_rope, apply_rope, CausalGQA, SwiGLU, TransformerBlock,
+# and SynapseGPT are imported from synapse_model (single source of truth;
+# see sft/SFT_TRAIN_PLAN.md §0.1). The model code there is byte-identical to
+# what used to live here.
+
+
+# ==================== 5. SHARDED DATASET ====================
+class ShardDataset(Dataset):
+    def __init__(self, tokens, block_size, stride):
+        self.tokens = tokens
+        self.block_size = block_size
+        self.stride = stride
+        self.length = max(0, (len(tokens) - block_size - 1) // stride)
+    def __len__(self):
+        return self.length
+    def __getitem__(self, idx):
+        s = idx * self.stride
+        if s + self.block_size + 1 > len(self.tokens):
+            s = len(self.tokens) - self.block_size - 1
+        chunk = self.tokens[s : s + self.block_size + 1]
+        return torch.from_numpy(chunk[:-1].copy()), torch.from_numpy(chunk[1:].copy())
+
+
+# ==================== 6. LOAD META & MODEL ====================
+META_PATH = os.path.join(SHARD_DIR, "meta.json")
+with open(META_PATH, "r") as f:
+    meta = json.load(f)
+VOCAB_SIZE_RAW = int(meta["vocab_size"])
+VOCAB_SIZE = VOCAB_SIZE_RAW
+if VOCAB_SIZE % 64 != 0:
+    VOCAB_SIZE = ((VOCAB_SIZE + 63) // 64) * 64
+    print(f"Vocab padded to {VOCAB_SIZE} (Tensor Core Optimized)")
+
+SHARD_DTYPE = np.dtype(meta.get("shard_dtype", "uint16"))
+assert VOCAB_SIZE_RAW <= np.iinfo(SHARD_DTYPE).max + 1, (
+    f"vocab_size {VOCAB_SIZE_RAW} exceeds {SHARD_DTYPE} range -- shards would overflow"
+)
+print(f"shard_dtype: {SHARD_DTYPE} | vocab raw: {VOCAB_SIZE_RAW} | padded: {VOCAB_SIZE}")
+
+current_tok_id = meta.get("tokenization_id")
+print(f"tokenization_id: {current_tok_id}")
+
+EXPECTED_TOK_ID = os.environ.get("EXPECTED_TOK_ID", "7a570a7ba9fc7985")
+tokid_txt_path = os.path.join(SHARD_DIR, "tokenization_id.txt")
+tokid_txt = open(tokid_txt_path).read().strip()
+if not (current_tok_id == tokid_txt == EXPECTED_TOK_ID):
+    raise RuntimeError(
+        f"tokenization_id mismatch: "
+        f"meta.json={current_tok_id!r}, "
+        f"tokenization_id.txt={tokid_txt!r}, "
+        f"expected={EXPECTED_TOK_ID!r}"
+    )
+
+model = SynapseGPT(VOCAB_SIZE).to(device)
+
+n_params = sum(p.numel() for p in model.parameters())
+n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f"Model: {n_params/1e9:.3f}B params ({n_trainable/1e9:.3f}B trainable)")
+
+# --- CHECKPOINT LOADING ---
+# Two checkpoint formats are supported:
+#   v2 (dict): {"schema": "v2", "model", "optimizer", "curr_step", "seen_shards", ...}
+#   legacy (plain state_dict): just model weights, no optimizer/step/seen_shards.
+# Old-format .pths still load — optimizer starts cold and step counter starts
+# at 0 (one-time cost on first migration). Every subsequent save writes v2.
+resume_path = None
+_saved_optimizer_state = None
+_saved_curr_step = 0
+# seen_shards is a list (with potential duplicates, one entry per training pass
+# through that shard) so multi-epoch sources track their consumed passes.
+_saved_seen_shards = []
+_saved_eval_history = []
+_saved_last_eval_loss = None
+if os.path.exists(CHECKPOINT_PATH):
+    train_manifest_path = os.path.join(MANIFEST_DIR, "training_latest.json")
+    safe_to_load = True
+    if os.path.exists(train_manifest_path) and current_tok_id:
+        with open(train_manifest_path) as f:
+            train_manifest = json.load(f)
+        ckpt_tok_id = train_manifest.get("tokenization_id")
+        if ckpt_tok_id and ckpt_tok_id != current_tok_id:
+            print(f"TOKENIZER MISMATCH — checkpoint: {ckpt_tok_id}, current: {current_tok_id}")
+            print(f"  Training from scratch.")
+            safe_to_load = False
+        else:
+            print(f"Tokenizer match confirmed.")
+    if safe_to_load:
+        print(f"Resuming from: {CHECKPOINT_PATH}")
+        resume_path = CHECKPOINT_PATH
+        ckpt_obj = torch.load(CHECKPOINT_PATH, map_location=device)
+        if isinstance(ckpt_obj, dict) and ckpt_obj.get("schema") == "v2":
+            state_dict = ckpt_obj["model"]
+            _saved_optimizer_state = ckpt_obj.get("optimizer")
+            _saved_curr_step = int(ckpt_obj.get("curr_step", 0))
+            _saved_seen_shards = list(ckpt_obj.get("seen_shards", []))
+            _saved_eval_history = list(ckpt_obj.get("eval_history", []))
+            _saved_last_eval_loss = ckpt_obj.get("last_eval_loss")
+            print(f"  v2 checkpoint: step={_saved_curr_step}, "
+                  f"seen_shards={len(_saved_seen_shards)}, "
+                  f"eval_history={len(_saved_eval_history)} pts, "
+                  f"optimizer_state={'yes' if _saved_optimizer_state else 'no'}")
+        else:
+            state_dict = ckpt_obj
+            print(f"  legacy checkpoint (model-only); optimizer + step start fresh")
+        new_state = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+        model_state = model.state_dict()
+        safe_state = {k: v for k, v in new_state.items() if k in model_state and v.shape == model_state[k].shape}
+        model.load_state_dict(safe_state, strict=False)
+        print(f"State loaded: {len(safe_state)} layers matched.")
+else:
+    print(f"No checkpoint found — training from scratch.")
+
+# Cap Inductor fusion so RMSNorm forward+backward doesn't get merged into one
+# Triton kernel that needs >99 KB of shared memory (Blackwell's opt-in ceiling).
+import torch._inductor.config as _ic
+_ic.max_fusion_size = 16
+_ic.epilogue_fusion = False
+try:
+    _ic.triton.persistent_reductions = False
+except AttributeError:
+    pass  # older PyTorch — skip; the two above carry most of the fix
+
+print("Compiling model...")
+model = torch.compile(model)
+
+# Optimizer
+param_dict = {pn: p for pn, p in model.named_parameters() if p.requires_grad}
+decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+optim_groups = [
+    {'params': decay_params,   'weight_decay': WEIGHT_DECAY},
+    {'params': nodecay_params, 'weight_decay': 0.0},
+]
+optimizer = optim.AdamW(optim_groups, lr=MAX_LR, betas=BETAS, fused=True)
+print(f"Optimizer: AdamW(fused) lr={MAX_LR} betas={BETAS} wd={WEIGHT_DECAY}")
+print(f"  decay groups: {sum(p.numel() for p in decay_params)/1e6:.1f}M params, "
+      f"nodecay: {sum(p.numel() for p in nodecay_params)/1e6:.3f}M params")
+
+if _saved_optimizer_state is not None:
+    try:
+        optimizer.load_state_dict(_saved_optimizer_state)
+        print("  restored optimizer state from checkpoint")
+    except Exception as e:
+        print(f"  WARNING: couldn't restore optimizer state ({e}); starting cold")
+
+
+# ==================== 7. SELECT SHARDS (TRAIN + EVAL SPLIT) ====================
+with open(os.path.join(SHARD_DIR, "shard_manifest.json"), "r") as f:
+    shard_manifest = json.load(f)
+
+def get_source_name(shard_entry):
+    source = shard_entry.get("source", "")
+    parts = source.replace("\\", "/").split("/")
+    for p in parts:
+        if p.startswith("data_"):
+            return p
+    return "other"
+
+all_shards_raw = shard_manifest["shards"]
+all_shards, missing_shards, wrong_size_shards = filter_present_shards(
+    all_shards_raw, SHARD_DIR, SHARD_DTYPE.itemsize
+)
+n_skipped = len(missing_shards) + len(wrong_size_shards)
+if n_skipped:
+    print(f"\nFiltering manifest against {SHARD_DIR}:")
+    print(f"  kept {len(all_shards)}/{len(all_shards_raw)} "
+          f"({len(missing_shards)} missing, {len(wrong_size_shards)} wrong-size)")
+    skipped_by_source = defaultdict(lambda: {"missing": 0, "wrong_size": 0})
+    for s in missing_shards:
+        skipped_by_source[get_source_name(s)]["missing"] += 1
+    for s in wrong_size_shards:
+        skipped_by_source[get_source_name(s)]["wrong_size"] += 1
+    for src, counts in sorted(skipped_by_source.items()):
+        bits = []
+        if counts["missing"]:
+            bits.append(f"{counts['missing']} missing")
+        if counts["wrong_size"]:
+            bits.append(f"{counts['wrong_size']} wrong-size")
+        print(f"    {src}: {', '.join(bits)}")
+if not all_shards:
+    raise FileNotFoundError(
+        f"No usable shards in {SHARD_DIR}: all {len(all_shards_raw)} "
+        f"manifest entries are missing or wrong-size on disk."
+    )
+
+shards_by_source = defaultdict(list)
+for s in all_shards:
+    shards_by_source[get_source_name(s)].append(s)
+
+print(f"\nAvailable data sources:")
+for src, shards in sorted(shards_by_source.items()):
+    src_tokens = sum(s["tokens"] for s in shards)
+    print(f"  {src}: {len(shards)} shards, {src_tokens:,} tokens")
+
+# Eval set is pinned in manifests/eval_shards.json so per-source losses stay
+# comparable across machines and restarts. Without the pin, the same seed
+# applied to a different local-shard subset picks different eval shards,
+# making per-source loss curves apples-to-oranges across resumes.
+#
+# First-ever run: select from the FULL shard manifest (deterministic across
+#   machines because shard_manifest.json is the same on Drive) and write the
+#   pin to disk + Drive.
+# Subsequent runs: load the pin, look up entries in the full manifest, and
+#   require each pinned shard to be locally present (fail loud if not — the
+#   launcher needs to pull them).
+# Set SYNAPSE_PIN_REGEN=1 to delete the pin and re-select.
+EVAL_PIN_PATH = os.path.join(MANIFEST_DIR, "eval_shards.json")
+
+if os.environ.get("SYNAPSE_PIN_REGEN") == "1" and os.path.exists(EVAL_PIN_PATH):
+    print(f"\nSYNAPSE_PIN_REGEN=1 — removing existing pin {EVAL_PIN_PATH}")
+    os.remove(EVAL_PIN_PATH)
+
+shards_by_source_full = defaultdict(list)
+for s in all_shards_raw:
+    shards_by_source_full[get_source_name(s)].append(s)
+
+if os.path.exists(EVAL_PIN_PATH):
+    with open(EVAL_PIN_PATH) as f:
+        pin = json.load(f)
+    pinned_names = pin["shards"]
+    print(f"\nUsing pinned eval set from {EVAL_PIN_PATH} ({len(pinned_names)} shards)")
+    by_name = {s["shard"]: s for s in all_shards_raw}
+    missing_from_manifest = [n for n in pinned_names if n not in by_name]
+    if missing_from_manifest:
+        raise RuntimeError(
+            f"pinned eval shards not found in shard_manifest.json: "
+            f"{missing_from_manifest[:5]}... — manifest changed since pinning"
+        )
+    eval_shards = [by_name[n] for n in pinned_names]
+    present_names = {s["shard"] for s in all_shards}
+    missing_locally = [n for n in pinned_names if n not in present_names]
+    if missing_locally:
+        raise RuntimeError(
+            f"{len(missing_locally)} pinned eval shard(s) missing locally "
+            f"(e.g. {missing_locally[:3]}). The launcher must pull them — "
+            f"or set SYNAPSE_PIN_REGEN=1 to drop the pin."
+        )
+else:
+    print(f"\nNo eval pin found — selecting fresh from full manifest")
+    _eval_rng = random.Random(EVAL_SEED)
+    eval_shards = []
+    for src, shards in shards_by_source_full.items():
+        pool = shards.copy()
+        _eval_rng.shuffle(pool)
+        n_eval = max(1, int(len(pool) * EVAL_FRACTION_PER_SOURCE)) if len(pool) > 1 else 0
+        n_eval = min(n_eval, MAX_EVAL_SHARDS_PER_SOURCE)
+        eval_shards.extend(pool[:n_eval])
+    pin_data = {
+        "tokenization_id": current_tok_id,
+        "eval_seed": EVAL_SEED,
+        "eval_fraction_per_source": EVAL_FRACTION_PER_SOURCE,
+        "max_eval_shards_per_source": MAX_EVAL_SHARDS_PER_SOURCE,
+        "shards": [s["shard"] for s in eval_shards],
+        "selected_from": "full_shard_manifest",
+    }
+    os.makedirs(MANIFEST_DIR, exist_ok=True)
+    _tmp = EVAL_PIN_PATH + ".tmp"
+    with open(_tmp, "w") as f:
+        json.dump(pin_data, f, indent=2)
+    os.replace(_tmp, EVAL_PIN_PATH)
+    print(f"  wrote pin: {EVAL_PIN_PATH}")
+    _ckpt_remote = os.environ.get("CHECKPOINT_PUSH_REMOTE", "").rstrip("/")
+    if _ckpt_remote.endswith("/checkpoints"):
+        _manifest_remote = _ckpt_remote[: -len("/checkpoints")] + "/manifests"
+        _push_to_remote_async(EVAL_PIN_PATH, _manifest_remote)
+    # Hard fail if any pinned shard isn't locally present (launcher needs to
+    # learn about the pin and pull them on next launch).
+    present_names = {s["shard"] for s in all_shards}
+    missing_locally = [s["shard"] for s in eval_shards if s["shard"] not in present_names]
+    if missing_locally:
+        raise RuntimeError(
+            f"{len(missing_locally)} freshly-pinned eval shard(s) not present "
+            f"locally (e.g. {missing_locally[:3]}). Re-run the launcher so it "
+            f"pulls the pin and the required eval shards."
+        )
+
+eval_pinned_names = {s["shard"] for s in eval_shards}
+train_pool_by_source = {
+    src: [s for s in shards if s["shard"] not in eval_pinned_names]
+    for src, shards in shards_by_source.items()
+}
+print(f"Held out {len(eval_shards)} eval shards "
+      f"({sum(s['tokens'] for s in eval_shards):,} tokens)")
+
+random.seed(42)
+selected_shards = []
+if DATA_MIX is None:
+    pool = [s for ss in train_pool_by_source.values() for s in ss]
+    random.shuffle(pool)
+    budget = MAX_TOKENS if MAX_TOKENS else float('inf')
+    running = 0
+    for s in pool:
+        if running >= budget:
+            break
+        selected_shards.append(s)
+        running += s["tokens"]
+else:
+    budget = MAX_TOKENS if MAX_TOKENS else sum(s["tokens"] for ss in train_pool_by_source.values() for s in ss)
+    for source, spec in DATA_MIX.items():
+        if isinstance(spec, dict):
+            weight = float(spec["weight"])
+            max_epochs = int(spec.get("max_epochs", 1))
+        else:
+            weight = float(spec)
+            max_epochs = 1
+        source_budget = int(budget * weight)
+        available = train_pool_by_source.get(source, [])
+        if not available:
+            print(f"  WARNING: {source} not found in shards, skipping")
+            continue
+        random.shuffle(available)
+        running = 0
+        # Repeat shards up to max_epochs to fill the source budget. Each pass
+        # adds the whole shuffled list again until the budget is hit or we've
+        # reached max_epochs (whichever comes first).
+        for _ in range(max_epochs):
+            if running >= source_budget:
+                break
+            for s in available:
+                if running >= source_budget:
+                    break
+                selected_shards.append(s)
+                running += s["tokens"]
+
+selected_tokens = sum(s["tokens"] for s in selected_shards)
+
+print(f"\nSelected for training:")
+selected_by_source = defaultdict(lambda: {"passes": 0, "tokens": 0, "unique": set()})
+for s in selected_shards:
+    src = get_source_name(s)
+    selected_by_source[src]["passes"] += 1
+    selected_by_source[src]["tokens"] += s["tokens"]
+    selected_by_source[src]["unique"].add(s["shard"])
+for src, info in sorted(selected_by_source.items()):
+    total_available = sum(s["tokens"] for s in shards_by_source.get(src, []))
+    pct = info["tokens"] / total_available * 100 if total_available else 0
+    n_unique = len(info["unique"])
+    epoch_note = f" x{info['passes']/n_unique:.1f}ep" if info["passes"] > n_unique else ""
+    print(f"  {src}: {n_unique} shards{epoch_note}, "
+          f"{info['tokens']:,} tokens ({pct:.0f}% of available)")
+print(f"\n  TOTAL: {len(selected_shards)} shard-passes, {selected_tokens:,} tokens")
+
+
+# ==================== 7b. STAGE SHARDS TO LOCAL DISK ====================
+# Drive FUSE reads at training time are 5-50 MB/s with random stalls. Copy
+# selected + eval shards to local SSD once; train from local for the run.
+# Override: STAGE_DIR=<path> or SKIP_STAGE=1.
+def _stage_shards_locally(src_dir, selected, evals):
+    if os.environ.get("SKIP_STAGE") == "1":
+        return src_dir
+    stage_dir = os.environ.get("STAGE_DIR") or ("/content/shards" if in_colab() else "")
+    if not stage_dir or os.path.abspath(stage_dir) == os.path.abspath(src_dir):
+        return src_dir
+    os.makedirs(stage_dir, exist_ok=True)
+    for fname in ("shard_manifest.json", "meta.json", "tokenization_id.txt"):
+        s = os.path.join(src_dir, fname)
+        d = os.path.join(stage_dir, fname)
+        if os.path.exists(s) and (not os.path.exists(d) or os.path.getsize(s) != os.path.getsize(d)):
+            shutil.copy2(s, d)
+    to_copy = sorted({s["shard"] for s in selected} | {s["shard"] for s in evals})
+    print(f"\nStaging {len(to_copy)} shards: {src_dir} -> {stage_dir}")
+    t0 = time.time()
+    total = 0
+    for i, name in enumerate(to_copy, 1):
+        s = os.path.join(src_dir, name)
+        d = os.path.join(stage_dir, name)
+        s_size = os.path.getsize(s)
+        if not (os.path.exists(d) and os.path.getsize(d) == s_size):
+            shutil.copy2(s, d)
+            if os.path.getsize(d) != s_size:
+                raise RuntimeError(f"staged size mismatch for {name}")
+        total += s_size
+        if i % 10 == 0 or i == len(to_copy):
+            elapsed = max(time.time() - t0, 0.01)
+            print(f"  {i}/{len(to_copy)} | {total/1024**3:.2f} GB | "
+                  f"{(total/1024**2)/elapsed:.0f} MB/s")
+    print(f"Staging done in {time.time()-t0:.0f}s.")
+    return stage_dir
+
+# ==================== 8. LR HORIZON, FRESH SELECTION, STAGING ====================
+# total_steps drives the cosine schedule and MUST be a lifetime constant
+# (LR_HORIZON_STEPS), not per-run. Otherwise curr_step (cumulative across
+# resumes) overruns this-run's-selection total and LR floors at MIN_LR.
+total_steps = LR_HORIZON_STEPS
+
+# Drop already-trained passes BEFORE staging, so only shards we'll actually
+# train get downloaded. seen_shards may contain duplicates (one entry per pass),
+# so subtract counts not membership: if wikipedia shard X has 4 planned passes
+# and 2 are already in seen_shards, 2 remain in selected_shards.
+if _saved_seen_shards:
+    seen_counts = defaultdict(int)
+    for name in _saved_seen_shards:
+        seen_counts[name] += 1
+    before = len(selected_shards)
+    remaining = []
+    for s in selected_shards:
+        if seen_counts[s["shard"]] > 0:
+            seen_counts[s["shard"]] -= 1
+        else:
+            remaining.append(s)
+    selected_shards = remaining
+    print(f"  Skipping {before - len(selected_shards)} already-trained shard-passes "
+          f"from prior run ({len(selected_shards)} fresh remaining)")
+
+# Trim the fresh selection to just enough to reach the step target (cosine end)
+# plus a small margin. Training hard-stops at LR_HORIZON_STEPS regardless (see
+# loop), so staging/ingesting more than this is wasted download. Shuffle first so
+# the trimmed subset preserves DATA_MIX proportions instead of front-loaded
+# sources. MAX_TOKENS should be set large enough that the fresh remainder exceeds
+# this need; the trim then caps the actual download to ~what we train.
+TOKENS_PER_STEP = BATCH_SIZE * GRAD_ACCUM_STEPS * BLOCK_SIZE
+needed_tokens = max(0, int((LR_HORIZON_STEPS - _saved_curr_step) * TOKENS_PER_STEP * 1.05))
+if needed_tokens == 0:
+    print(f"  Already at/past LR horizon ({_saved_curr_step:,} >= {LR_HORIZON_STEPS:,}); "
+          f"nothing new to train.")
+    selected_shards = []
+elif sum(s["tokens"] for s in selected_shards) > needed_tokens:
+    random.shuffle(selected_shards)
+    trimmed, acc = [], 0
+    for s in selected_shards:
+        trimmed.append(s)
+        acc += s["tokens"]
+        if acc >= needed_tokens:
+            break
+    print(f"  Trimmed fresh selection to {len(trimmed)} shards (~{acc/1e9:.2f}B tok) "
+          f"to reach step {LR_HORIZON_STEPS:,} from {_saved_curr_step:,}")
+    selected_shards = trimmed
+
+selected_tokens = sum(s["tokens"] for s in selected_shards)
+this_run_steps = (selected_tokens // BLOCK_SIZE // BATCH_SIZE * EPOCHS) // GRAD_ACCUM_STEPS
+
+# Stage AFTER subtraction+trim: only the fresh shards we'll train (+ eval) hit disk.
+SHARD_DIR = _stage_shards_locally(SHARD_DIR, selected_shards, eval_shards)
+
+print(f"  Effective Batch Size: {BATCH_SIZE * GRAD_ACCUM_STEPS} sequences "
+      f"({TOKENS_PER_STEP:,} tokens/step)")
+print(f"  LR horizon (lifetime): {total_steps:,} steps | Warmup: {WARMUP_STEPS} | "
+      f"resuming at step {_saved_curr_step:,} ({_saved_curr_step/total_steps:.1%} through)")
+print(f"  This run will add ~{this_run_steps:,} steps (hard stop at step {LR_HORIZON_STEPS:,})")
+print(f"  Mid-epoch save every {SAVE_EVERY_N_SHARDS} shards | Eval every {EVAL_EVERY_STEPS} steps")
+
+
+# ==================== 9. EVAL HELPER ====================
+@torch.no_grad()
+def run_eval(model, eval_shards, n_batches_per_source):
+    """Per-source eval. Returns {source: mean_loss, "overall": unweighted mean of sources}.
+    The unweighted "overall" lets a small source (e.g. wikipedia, 1 eval shard) move
+    the headline number as much as a large source (code, 5 shards) - so a code-heavy
+    eval pool no longer masks regressions on other domains."""
+    model.eval()
+    by_source = defaultdict(list)
+    by_src_pool = defaultdict(list)
+    for s in eval_shards:
+        by_src_pool[get_source_name(s)].append(s)
+    rng = random.Random(EVAL_SEED)
+    for src, pool in by_src_pool.items():
+        pool = pool.copy()
+        rng.shuffle(pool)
+        seen = 0
+        for shard_info in pool:
+            shard_path = os.path.join(SHARD_DIR, shard_info["shard"])
+            try:
+                tokens = np.fromfile(shard_path, dtype=SHARD_DTYPE).astype(np.int64)
+            except FileNotFoundError:
+                continue
+            ds = ShardDataset(tokens, BLOCK_SIZE, STRIDE)
+            if len(ds) == 0:
+                continue
+            loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+            for xb, yb in loader:
+                xb = xb.to(device, non_blocking=True)
+                yb = yb.to(device, non_blocking=True)
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    logits = model(xb)
+                    loss = F.cross_entropy(logits.view(-1, VOCAB_SIZE), yb.view(-1))
+                by_source[src].append(loss.item())
+                seen += 1
+                if seen >= n_batches_per_source:
+                    break
+            del tokens, ds, loader
+            if seen >= n_batches_per_source:
+                break
+    model.train()
+    result = {src: sum(losses) / len(losses) for src, losses in by_source.items() if losses}
+    result["overall"] = (sum(result.values()) / len(result)) if result else float('nan')
+    return result
+
+
+# ==================== 10. TRAINING LOOP ====================
+def get_lr(it, total_it):
+    if it < WARMUP_STEPS:
+        return MAX_LR * it / WARMUP_STEPS
+    decay_ratio = (it - WARMUP_STEPS) / max(1, (total_it - WARMUP_STEPS))
+    coeff = 0.5 * (1.0 + math.cos(math.pi * min(1.0, decay_ratio)))
+    return MIN_LR + coeff * (MAX_LR - MIN_LR)
+
+curr_step = _saved_curr_step
+# Multiset (list, one entry per training pass) — matches the resume subtraction
+# at section 8 which counts passes. A set here would collapse multi-epoch passes
+# to one, so max_epochs>1 sources would never converge across resumes.
+seen_shards = list(_saved_seen_shards)
+final_loss = None
+last_grad_norm = None
+last_eval_loss = _saved_last_eval_loss
+eval_history = list(_saved_eval_history)
+train_start = time.time()
+
+def _write_training_manifest(status="running", full_hash=False):
+    elapsed = time.time() - train_start
+    manifest = {
+        "stage": "training",
+        "status": status,
+        "created": datetime.datetime.now().isoformat(),
+        "checkpoint": file_info(CHECKPOINT_PATH, full_hash=full_hash),
+        "checkpoint_step": curr_step,
+        "tokenization_id": current_tok_id,
+        "config": {
+            "arch": "synapse_gpt_2b_d2560_l28",
+            "block_size": BLOCK_SIZE, "stride": STRIDE,
+            "embed_dim": EMBED_DIM, "num_layers": NUM_LAYERS,
+            "num_heads": NUM_HEADS, "num_kv_heads": NUM_KV_HEADS,
+            "ff_hidden_dim": FF_HIDDEN_DIM,
+            "rope_base": ROPE_BASE, "rmsnorm_eps": RMSNORM_EPS,
+            "gradient_checkpointing": GRAD_CHECKPOINT,
+            "vocab_size_raw": VOCAB_SIZE_RAW, "vocab_size_padded": VOCAB_SIZE,
+            "shard_dtype": str(SHARD_DTYPE),
+            "n_params": n_params, "n_trainable": n_trainable,
+            "batch_size": BATCH_SIZE, "grad_accum_steps": GRAD_ACCUM_STEPS,
+            "epochs": EPOCHS, "max_lr": MAX_LR, "min_lr": MIN_LR,
+            "warmup_steps": WARMUP_STEPS, "weight_decay": WEIGHT_DECAY,
+            "betas": list(BETAS), "grad_clip": GRAD_CLIP,
+            "precision": "bfloat16", "optimizer": "AdamW (fused)",
+            "lr_schedule": "cosine_with_warmup",
+        },
+        "data_selection": {
+            "max_tokens": MAX_TOKENS,
+            "data_mix": DATA_MIX,
+            "selected_shards": len(selected_shards),
+            "selected_tokens": selected_tokens,
+            "sources": {
+                src: {**info, "unique": sorted(info["unique"])}
+                for src, info in selected_by_source.items()
+            },
+            "eval_shards": len(eval_shards),
+            "eval_tokens": sum(s["tokens"] for s in eval_shards),
+        },
+        "results": {
+            "final_loss": final_loss,
+            "final_eval_loss": last_eval_loss,
+            "eval_history": eval_history,
+            "last_grad_norm": last_grad_norm,
+            "total_optimizer_steps": curr_step,
+            "lr_horizon_steps": LR_HORIZON_STEPS,
+            "total_hours": round(elapsed / 3600, 2),
+            "resumed_from": resume_path,
+        },
+    }
+    manifest_path = os.path.join(MANIFEST_DIR, "training_latest.json")
+    tmp_path = manifest_path + ".tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+    os.replace(tmp_path, manifest_path)
+    print(f"Manifest saved: {manifest_path} (status={status})")
+    _ckpt_remote = os.environ.get("CHECKPOINT_PUSH_REMOTE", "")
+    if _ckpt_remote.rstrip("/").endswith("/checkpoints"):
+        _manifest_remote = _ckpt_remote.rstrip("/")[: -len("/checkpoints")] + "/manifests"
+        _push_to_remote_async(manifest_path, _manifest_remote)
+
+def _save_checkpoint(final=False):
+    # Bundle model + optimizer + step counter + seen-shards into one v2 file,
+    # so a future resume can fully restore (model load + warm Adam + same LR
+    # schedule position + skip already-trained shards + eval curve).
+    torch.save({
+        "schema": "v2",
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "curr_step": curr_step,
+        "seen_shards": sorted(seen_shards),
+        "tokenization_id": current_tok_id,
+        "eval_history": eval_history,
+        "last_eval_loss": last_eval_loss,
+    }, CHECKPOINT_PATH)
+    _push_to_remote_async(CHECKPOINT_PATH, os.environ.get("CHECKPOINT_PUSH_REMOTE"))
+    _write_training_manifest(
+        status="completed" if final else "running",
+        full_hash=final,
+    )
+
+print("\nSTARTING TRAINING (BFloat16, GQA, RoPE, RMSNorm, grad-ckpt)\n")
+
+stop_training = False
+for epoch in range(1, EPOCHS + 1):
+    model.train()
+    epoch_shards = selected_shards.copy()
+    random.shuffle(epoch_shards)
+
+    for shard_idx, shard_info in enumerate(epoch_shards):
+        shard_path = os.path.join(SHARD_DIR, shard_info["shard"])
+        shard_name = shard_info["shard"]
+        shard_source = get_source_name(shard_info)
+
+        # Surface the source .txt files inside this merged shard so loss
+        # spikes/dips are interpretable from scrollback.
+        sources = shard_info.get("merged_from", [])
+        if sources:
+            names = [os.path.basename(s["source"]) for s in sources]
+            head = ", ".join(names[:5])
+            suffix = f", ...and {len(names)-5} more" if len(names) > 5 else ""
+            print(f"\nEp {epoch} [{shard_idx+1}/{len(epoch_shards)}] "
+                  f"{shard_source}/{shard_name} - {len(names)} sources:\n"
+                  f"    {head}{suffix}")
+
+        tokens = np.fromfile(shard_path, dtype=SHARD_DTYPE).astype(np.int64)
+        dataset = ShardDataset(tokens, BLOCK_SIZE, STRIDE)
+        if len(dataset) == 0:
+            continue
+
+        loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True,
+                            num_workers=2, pin_memory=True)
+        pbar = tqdm(loader,
+                    desc=f"Ep {epoch} [{shard_idx+1}/{len(epoch_shards)}] {shard_source}/{shard_name}",
+                    dynamic_ncols=True, mininterval=1.0)
+
+        # Accumulation window counter that resets per optimizer step (NOT per
+        # batch_idx) so the clean-break flush below knows the trailing count.
+        micro_in_window = 0
+        shard_completed = True
+        for batch_idx, (xb, yb) in enumerate(pbar):
+            lr = get_lr(curr_step, total_steps)
+            for pg in optimizer.param_groups:
+                pg['lr'] = lr
+
+            xb = xb.to(device, non_blocking=True)
+            yb = yb.to(device, non_blocking=True)
+
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                logits = model(xb)
+                loss = F.cross_entropy(logits.view(-1, VOCAB_SIZE), yb.view(-1))
+                loss = loss / GRAD_ACCUM_STEPS
+            loss.backward()
+            micro_in_window += 1
+
+            if micro_in_window == GRAD_ACCUM_STEPS:
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+                last_grad_norm = float(grad_norm)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                micro_in_window = 0
+                curr_step += 1
+                final_loss = loss.item() * GRAD_ACCUM_STEPS
+                elapsed = time.time() - train_start
+
+                pbar.set_postfix(loss=f"{final_loss:.3f}",
+                                 gnorm=f"{last_grad_norm:.2f}",
+                                 lr=f"{lr:.2e}",
+                                 step=curr_step,
+                                 hrs=f"{elapsed/3600:.1f}",
+                                 eval=("-" if last_eval_loss is None else f"{last_eval_loss:.3f}"))
+
+                if curr_step % EVAL_EVERY_STEPS == 0:
+                    eval_result = run_eval(model, eval_shards, EVAL_BATCHES)
+                    last_eval_loss = eval_result["overall"]
+                    eval_history.append({
+                        "step": curr_step,
+                        "loss": last_eval_loss,
+                        "by_source": {k: v for k, v in eval_result.items() if k != "overall"},
+                        "elapsed_hrs": round(elapsed / 3600, 2),
+                    })
+                    per_src = " ".join(f"{src.replace('data_', '')}={v:.2f}"
+                                       for src, v in sorted(eval_result.items()) if src != "overall")
+                    print(f"  [eval @ step {curr_step}] overall={last_eval_loss:.3f} | "
+                          f"{per_src} (train={final_loss:.3f}, gnorm={last_grad_norm:.2f})")
+
+                # Hard stop at the cosine end so we land on LR_HORIZON_STEPS
+                # rather than overshooting into the flat-MIN_LR tail. This shard
+                # is left mid-consumed, so it is NOT marked seen (see below).
+                if curr_step >= total_steps:
+                    shard_completed = False
+                    stop_training = True
+                    break
+
+        # Clean break at the shard boundary: flush the trailing partial window so
+        # this shard's leftover micro-batches form their OWN step instead of
+        # contaminating the next shard's first window. The grads were divided by
+        # GRAD_ACCUM_STEPS but only `micro_in_window` of them accumulated, so
+        # rescale to the true mean over the partial window before clipping.
+        if micro_in_window > 0:
+            scale = GRAD_ACCUM_STEPS / micro_in_window
+            for p in model.parameters():
+                if p.grad is not None:
+                    p.grad.mul_(scale)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+            last_grad_norm = float(grad_norm)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            curr_step += 1
+            final_loss = loss.item() * GRAD_ACCUM_STEPS
+            if curr_step >= total_steps:
+                stop_training = True
+
+        del tokens, dataset, loader
+        # Only record a pass once the shard is fully consumed; a step-stopped
+        # partial shard stays unseen so it can be picked up on a later resume.
+        if shard_completed:
+            seen_shards.append(shard_name)
+
+        if (shard_idx + 1) % SAVE_EVERY_N_SHARDS == 0 or stop_training:
+            elapsed = time.time() - train_start
+            print(f"  Mid-epoch save at shard {shard_idx+1}/{len(epoch_shards)} "
+                  f"(step {curr_step}, loss {final_loss:.3f}, {elapsed/3600:.1f}h elapsed)...")
+            _save_checkpoint()
+
+        if stop_training:
+            print(f"  Reached LR horizon ({curr_step:,} >= {total_steps:,}) — stopping.")
+            break
+
+    if stop_training:
+        break
+    print(f"Saving Epoch {epoch}...")
+    _save_checkpoint()
+
+
+# ==================== 11. FINALIZE ====================
+total_time = time.time() - train_start
+print(f"Training Complete. {total_time/3600:.1f} hours, {curr_step} steps.")
+_save_checkpoint(final=True)
+
+print(f"  tokenization_id: {current_tok_id}")
+print(f"  final_loss: {final_loss}")
+print(f"  final_eval_loss: {last_eval_loss}")
+print(f"  total_steps: {curr_step}")
