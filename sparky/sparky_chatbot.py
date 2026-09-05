@@ -20,6 +20,7 @@ Usage:
 """
 import json
 import os
+import re
 import sys
 import time
 import signal
@@ -37,8 +38,29 @@ from sparky_chat_template import build_sft_prompt, sft_stop_token_ids
 
 # Tool loop + the ONE tool system prompt live in sft/ (shared with the eval).
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "sft"))
-from tool_loop import run_tool_loop
+from tool_loop import run_tool_loop, execute as tool_execute
 from tools_runtime import CANONICAL_TOOL_SYSTEM
+
+# ── forced-search assist ────────────────────────────────────────────────────
+# The v3 model searches on short factoid questions (its whole training
+# distribution) but NOT on news/current-events phrasing or "search for X"
+# instructions — zero such training examples. Until v3.1 adds that data, the
+# CHATBOT detects the intent, issues the search itself, and injects the tool
+# turn in the trained wire format; the model then continues from the snippet,
+# which is 100% in-distribution (same trick as the generator's force_first_tool).
+NEWS_INTENT_PAT = re.compile(
+    r"\b(news|headlines?|latest|current events?|recently|this (week|month|year)|today)\b"
+    r"|^search\b|\bsearch (for|the web|online)\b|\blook up\b|\bgoogle\b", re.IGNORECASE)
+
+
+def derive_search_query(text):
+    """Strip instruction filler so 'search for X' / 'tell me about X' -> 'X'."""
+    q = text.strip()
+    q = re.sub(r"^(please\s+)?(can you\s+|could you\s+)?"
+               r"(search( the web| online)?( for)?|look up|google|tell me( about)?|"
+               r"find( out)?( about)?|give me|show me)\s*", "", q, flags=re.IGNORECASE)
+    q = q.strip(" ?.!\"'")
+    return q or text.strip()
 
 # ── tokenizer ──────────────────────────────────────────────────────────────
 
@@ -456,6 +478,7 @@ HTML_PAGE = r'''
             assistantMsg.appendChild(segment);
             const cursor = document.createElement('span'); cursor.className = 'cursor';
             assistantMsg.appendChild(cursor);
+            let pendingTool = null;   // header of the tool block awaiting its result
             function toolBlock(hdr, body) {
                 const d = document.createElement('div'); d.className = 'tool';
                 d.innerHTML = '<div class="tool-hdr">' + esc(hdr) + '</div><pre>' + esc(body) + '</pre>';
@@ -463,6 +486,7 @@ HTML_PAGE = r'''
                 segment = document.createElement('span');
                 assistantMsg.insertBefore(segment, cursor);
                 responseText = '';
+                return d;
             }
 
             try {
@@ -501,10 +525,16 @@ HTML_PAGE = r'''
                                 }
                                 if (data.tool_call) {
                                     const c = data.tool_call;
-                                    const body = c.tool === 'python' ? (c.code || '') : JSON.stringify(c);
-                                    toolBlock('\u{1F40D} ' + (c.tool || 'malformed tool call'), body);
+                                    let hdr, body;
+                                    if (c.tool === 'search') { hdr = '\u{1F50D} search' + (data.forced ? ' \u00b7 auto' : ''); body = c.query || JSON.stringify(c); }
+                                    else if (c.tool === 'python') { hdr = '\u{1F40D} python'; body = c.code || JSON.stringify(c); }
+                                    else { hdr = '\u26A0\uFE0F ' + (c.tool || 'malformed tool call'); body = c.code || c.query || c.raw || JSON.stringify(c); }
+                                    const d = toolBlock(hdr + '  \u2026running', body);
+                                    pendingTool = d.querySelector('.tool-hdr');
+                                    pendingTool._base = hdr;
                                 }
                                 if (data.tool_result !== undefined) {
+                                    if (pendingTool) { pendingTool.textContent = pendingTool._base + '  \u2713'; pendingTool = null; }
                                     toolBlock('\u2192 result', data.tool_result);
                                 }
                                 if (data.error) {
@@ -708,6 +738,19 @@ def chat():
                     hist = hist[1:]
                     while hist and hist[0]["role"] != "user":   # history must open on a user turn
                         hist = hist[1:]
+                # Forced-search assist: news/"search for" intent -> the chatbot
+                # searches and seeds the trained tool-turn; the model continues.
+                seeded = []
+                last_user = hist[-1].get("content", "") if hist and hist[-1]["role"] == "user" else ""
+                if tools and last_user and NEWS_INTENT_PAT.search(last_user) \
+                        and os.environ.get("BRAVE_API_KEY"):
+                    call = {"tool": "search", "query": derive_search_query(last_user)}
+                    yield sse({"tool_call": call, "forced": True})
+                    result = tool_execute(call)
+                    yield sse({"tool_result": result})
+                    seeded = [{"role": "assistant", "content": "", "tool_call": call},
+                              {"role": "tool", "content": result}]
+                    hist = hist + seeded
                 for ev in run_tool_loop(generate_ids, tokenizer, hist, system,
                                         max_prompt_tokens=max_prompt):
                     if ev["type"] == "token":
@@ -719,7 +762,8 @@ def chat():
                     elif ev["type"] == "final":
                         if ev["status"] != "answered":
                             yield sse({"error": f"tool loop stopped: {ev['status']}"})
-                        yield sse({"done": True, "status": ev["status"], "messages": ev["messages"]})
+                        yield sse({"done": True, "status": ev["status"],
+                                   "messages": seeded + ev["messages"]})
                 return
 
             # Pretrain has no chat structure — continue the latest user text.
