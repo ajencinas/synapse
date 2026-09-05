@@ -281,7 +281,13 @@ HTML_PAGE = r'''
             if (!e.target.checked) {            // instant stop: speech AND mic
                 window.speechSynthesis.cancel();
                 stopListening();
+                document.getElementById('status').textContent = 'voice mode off';
+                return;
             }
+            // Speak from inside the click gesture: satisfies Chrome's activation
+            // requirement for speechSynthesis and proves audio output works.
+            console.log('[voice] enabled; speaking confirmation');
+            speakText('Voice mode on.', document.createElement('button'));
         });
 
         settingsToggle.addEventListener('click', () => {
@@ -358,13 +364,20 @@ HTML_PAGE = r'''
             if (activeSpeakBtn === btn) { stopSpeaking(); return; }   // toggle off
             stopSpeaking();
             const eng = voices.find(v => v.lang && v.lang.startsWith('en'));
-            for (const chunk of chunkText(text)) {
+            const chunks = chunkText(text);
+            console.log('[voice] speak:', chunks.length, 'chunks,', text.length, 'chars');
+            for (const chunk of chunks) {
                 const utterance = new SpeechSynthesisUtterance(chunk);
                 utterance.rate = 1.0;
                 utterance.pitch = 1.0;
                 if (eng) utterance.voice = eng;
+                utterance.onstart = () => { document.getElementById('status').textContent = '🔊 speaking…'; };
+                utterance.onerror = (ev) => console.log('[voice] utterance ERROR:', ev.error);
                 window.speechSynthesis.speak(utterance);
             }
+            setTimeout(() => console.log('[voice] +1s flags: speaking=' +
+                window.speechSynthesis.speaking + ' pending=' + window.speechSynthesis.pending +
+                ' paused=' + window.speechSynthesis.paused), 1000);
             activeSpeakBtn = btn;
             btn.classList.add('speaking');
             btn.textContent = '⏸️';
@@ -441,6 +454,7 @@ HTML_PAGE = r'''
             micBtn.classList.add('active');
             micBtn.textContent = '🔴';
             userInput.placeholder = 'Listening... (tap 🔴 to stop)';
+            document.getElementById('status').textContent = '🎙️ listening…';
             try { recognition.start(); }
             catch (e) { console.log('mic start failed:', e); stopListening(); }
         }
@@ -569,11 +583,14 @@ HTML_PAGE = r'''
                                     const spoken = responseText;
                                     if (spoken) {
                                         const sBtn = attachSpeakButton(assistantMsg, () => spoken);
+                                        console.log('[voice] done event; voiceMode=' +
+                                            document.getElementById('voice-mode').checked + ' status=' + data.status);
                                         if (document.getElementById('voice-mode').checked && data.status !== 'error') {
                                             speakText(spoken, sBtn, () => {
                                                 // re-check at hand-off so unticking mid-speech stops the loop;
                                                 // brief pause so the mic doesn't catch the TTS tail
                                                 setTimeout(() => {
+                                                    console.log('[voice] playback done -> mic');
                                                     if (document.getElementById('voice-mode').checked
                                                             && recognition && !listening) startListening();
                                                 }, 400);
