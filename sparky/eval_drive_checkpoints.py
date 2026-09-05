@@ -33,7 +33,7 @@ from sparky_eval import TASK_PRESETS, SynapseEvalLM  # noqa: E402
 from sparky_model import BLOCK_SIZE, VOCAB_SIZE  # noqa: E402
 
 
-DEFAULT_WORK_DIR = "/media/alfonso/shared/synapse_drive_eval"
+DEFAULT_WORK_DIR = os.environ.get("SYNAPSE_EVAL_DIR", os.path.expanduser("~/synapse_drive_eval"))
 DEFAULT_REMOTE = "gdrive"
 DEFAULT_DRIVE_PATH = "synapse"
 DEFAULT_PRESET = "quick"

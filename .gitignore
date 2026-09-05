@@ -99,3 +99,8 @@ coverage.xml
 
 # Backup directories
 old_backup/
+
+# Local spreadsheets / editor workspaces (not for the public repo)
+assessments.ods
+*.ods
+*.code-workspace

@@ -4,13 +4,15 @@
 from __future__ import annotations
 
 import re
+import os
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
 
-DEFAULT_RESULTS_DIR = Path("/media/alfonso/shared/synapse_drive_eval/results")
+DEFAULT_RESULTS_DIR = Path(os.environ.get("SYNAPSE_EVAL_DIR",
+                           os.path.expanduser("~/synapse_drive_eval"))) / "results"
 
 
 def read_csv(path: Path) -> pd.DataFrame:
@@ -102,7 +104,7 @@ def render_overview(data: dict[str, pd.DataFrame]) -> None:
         st.error("All checkpoints failed. The current run produced failure diagnostics but no benchmark/loss trend metrics.")
         st.code(
             "python3 sparky/eval_drive_checkpoints.py \\\n"
-            "  --work-dir /media/alfonso/shared/synapse_drive_eval \\\n"
+            "  --work-dir ~/synapse_drive_eval \\\n"
             "  --preset quick \\\n"
             "  --eval-batches 64 \\\n"
             "  --source-eval-batches 8 \\\n"

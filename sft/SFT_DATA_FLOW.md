@@ -2,9 +2,7 @@
 
 All SFT inputs, the notebook/script that produces each, where the data lives on
 Drive, and how it flows to training. The Mermaid diagram below renders inline on
-GitHub/VS Code; a rendered image is also committed
-(`SFT_DATA_FLOW.png` / `.svg`, regenerate with
-`dot -Tpng sft/SFT_DATA_FLOW.dot -o sft/SFT_DATA_FLOW.png`).
+GitHub/VS Code.
 
 ```mermaid
 flowchart TB

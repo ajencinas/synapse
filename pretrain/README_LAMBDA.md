@@ -127,8 +127,9 @@ All optional — values can be set in the shell before running `train.py`:
 
 ## Data Mix Configuration
 
-By default `train.py` trains on **100% Wikipedia**. Before running a real training run,
-edit the `DATA_MIX` dict at `pretrain/train.py:192-204` to enable all sources:
+`train.py` ships with the full multi-source `DATA_MIX` (wikipedia, C4/fineweb, code,
+finemath, arxiv, books, synthetic math — see the dict near the top of the file).
+Adjust weights there if you want a different mix:
 
 ```python
 DATA_MIX = {

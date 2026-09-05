@@ -22,7 +22,12 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GEN_DIR = os.path.join(REPO_ROOT, "download_pretrain_others", "src")
 sys.path.insert(0, GEN_DIR)
 
-import generate_math_operations_cot as g  # noqa: E402
+try:
+    import generate_math_operations_cot as g  # noqa: E402
+except ImportError:                            # pragma: no cover
+    raise unittest.SkipTest(
+        "download_pretrain_others/ (private synthetic-data generators) not present "
+        "— this test only runs on the author's machine")
 
 
 BANNED_SUBSTRINGS = ["('+'", "('-'", "('×'", "('*'", "('/'"]
