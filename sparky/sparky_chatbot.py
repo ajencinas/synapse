@@ -377,9 +377,17 @@ HTML_PAGE = r'''
                 if (onDone) onDone();
             };
             // There is no single utterance-end for a queued batch, so poll.
+            // CRITICAL: speak() only QUEUES — `speaking` stays false until the
+            // voice starts (can be >250ms), while `pending` is true. Checking
+            // only `speaking` fired done() before playback began; in voice mode
+            // that started the mic, which preempts and silences the synthesis.
             startKeepAlive();
+            const t0 = Date.now();
             const poll = setInterval(() => {
-                if (!window.speechSynthesis.speaking) { clearInterval(poll); done(); }
+                const ss = window.speechSynthesis;
+                if (ss.speaking || ss.pending) return;
+                if (Date.now() - t0 < 1500) return;   // grace: engine still warming up
+                clearInterval(poll); done();
             }, 250);
         }
 
