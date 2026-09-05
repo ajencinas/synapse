@@ -724,6 +724,17 @@ def chat():
                                   eot_id=eot_id, stop_tokens=stop_tokens)
 
     def generate():
+        try:
+            yield from _generate()
+        except Exception as e:
+            # A dead SSE stream renders as a cryptic browser "error in input
+            # stream" — surface the real exception in the UI instead.
+            import traceback
+            traceback.print_exc()
+            yield sse({"error": f"server error: {type(e).__name__}: {e}"})
+            yield sse({"done": True, "status": "error", "messages": []})
+
+    def _generate():
         # gen_lock is held across the WHOLE tool loop: a model switch or a second
         # request must never interleave with a multi-round trace.
         with gen_lock:
@@ -888,6 +899,10 @@ def main():
 
     # ── tokenizer ──
     print(f"[tokenizer] loading {local_tok}")
+    # tools_runtime.truncate_tokens lazy-loads ITS OWN tokenizer via SYNAPSE_DIR /
+    # SYNAPSE_TOKENIZER — neither exists on a Colab box with Drive unmounted, so the
+    # first tool result would crash the SSE stream. Point it at the same file.
+    os.environ.setdefault("SYNAPSE_TOKENIZER", os.path.abspath(local_tok))
     tokenizer, eot_id = load_tokenizer(local_tok)
     print(f"[tokenizer] vocab={tokenizer.get_vocab_size()} eot_id={eot_id}")
 
