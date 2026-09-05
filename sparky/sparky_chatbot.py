@@ -277,6 +277,13 @@ HTML_PAGE = r'''
         /* ── Settings panel toggle (mobile) ───────────────────────── */
         const settingsToggle = document.getElementById('settings-toggle');
         const settingsPanel = document.getElementById('settings');
+        document.getElementById('voice-mode').addEventListener('change', (e) => {
+            if (!e.target.checked) {            // instant stop: speech AND mic
+                window.speechSynthesis.cancel();
+                stopListening();
+            }
+        });
+
         settingsToggle.addEventListener('click', () => {
             const open = settingsPanel.classList.toggle('open');
             settingsToggle.setAttribute('aria-expanded', open);
@@ -421,12 +428,13 @@ HTML_PAGE = r'''
         }
 
         function startListening() {
-            if (!recognition) return;
+            if (!recognition || listening) return;
             listening = true;
             micBtn.classList.add('active');
             micBtn.textContent = '🔴';
-            userInput.placeholder = 'Listening...';
-            recognition.start();
+            userInput.placeholder = 'Listening... (tap 🔴 to stop)';
+            try { recognition.start(); }
+            catch (e) { console.log('mic start failed:', e); stopListening(); }
         }
 
         function stopListening() {
@@ -434,6 +442,9 @@ HTML_PAGE = r'''
             micBtn.classList.remove('active');
             micBtn.textContent = '🎙️';
             userInput.placeholder = 'Type your message...';
+            // Resetting the UI is not enough — actually kill the recognizer
+            // (it kept running before, so the mic looked stuck on).
+            if (recognition) { try { recognition.abort(); } catch (e) {} }
         }
 
         micBtn.addEventListener('click', () => {
@@ -552,9 +563,12 @@ HTML_PAGE = r'''
                                         const sBtn = attachSpeakButton(assistantMsg, () => spoken);
                                         if (document.getElementById('voice-mode').checked && data.status !== 'error') {
                                             speakText(spoken, sBtn, () => {
-                                                // re-check at hand-off so unticking mid-speech stops the loop
-                                                if (document.getElementById('voice-mode').checked
-                                                        && recognition && !listening) startListening();
+                                                // re-check at hand-off so unticking mid-speech stops the loop;
+                                                // brief pause so the mic doesn't catch the TTS tail
+                                                setTimeout(() => {
+                                                    if (document.getElementById('voice-mode').checked
+                                                            && recognition && !listening) startListening();
+                                                }, 400);
                                             });
                                         }
                                     }
@@ -571,7 +585,7 @@ HTML_PAGE = r'''
                 conversation.pop();  // drop the user turn that never got a reply
             }
             sendBtn.disabled = false;
-            userInput.focus();
+            if (!document.getElementById('voice-mode').checked) userInput.focus();
         }
 
         sendBtn.addEventListener('click', sendMessage);
