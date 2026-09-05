@@ -1,170 +1,74 @@
-# synapse
+# SynapseGPT
 
-End-to-end LLM pretraining pipeline: gather text corpora, generate synthetic data, tokenize, and pretrain.
+A **2B-parameter LLM built end to end from scratch**: corpus collection → custom
+tokenizer → pretraining → three generations of supervised fine-tuning → an agentic
+tool loop (sandboxed **python** + live **web search**) → a served chatbot with
+voice mode, plus the full evaluation stack used to gate every release.
 
-## What's in this GitHub repo vs. what isn't
+## The model
 
-This repo is a **subset** of the full local working directory. It contains the parts that are stable, reproducible, and reasonable to share publicly. Bulk text corpora, generated data, secrets, and shared utilities live only on the author's machine.
+| | |
+|---|---|
+| Architecture | decoder-only transformer, 2.09B params — d=2560, 28 layers, 20 heads (GQA, 4 KV), SwiGLU, RoPE, RMSNorm, 2048 context |
+| Tokenizer | custom byte-level BPE, 64k vocab, digit-per-token, dedicated tool tokens (`<|tool_call|>`, `<|tool_result|>`) |
+| Pretraining | ~44B tokens (code / math / arxiv / wikipedia / web / books / synthetic), bf16, single-GPU runs on Colab & rented VMs |
+| SFT (v3, current) | 15 sources, 187,989 examples, response-only masked loss, tool-use + tool-abstention + web-search traces |
+| Tools | model-emitted JSON tool calls executed by a shared inference loop: sandboxed python (no network, rlimits) and Brave-backed web search |
 
-**In GitHub:**
+Measured (v3, held-out data, greedy decoding): the model calls python on 98–100% of
+hard math (+10 pts pass@1 over no-tool), **searches on 100% of fact questions with
+74.5% accuracy against live web results**, declines tools on prose (0% false calls),
+and never emits a tool call without the tool system prompt (0/100).
 
-| Path                       | What it is                                                 |
-| -------------------------- | ---------------------------------------------------------- |
-| `README.md`                | This file                                                  |
-| `requirements.txt`         | Python dependencies                                        |
-| `download_pretrain_data/`  | Notebooks that download public datasets (C4, Wikipedia, RedPajama, code, FineMath, reasoning) |
-| `tokenize/`                | Byte-Level BPE tokenizer training pipeline (Colab + Drive) |
-| `pretrain/`                | Pretraining notebook                                       |
+## Repository map
 
-**Not in GitHub** (kept local only):
+| Path | What it is |
+|---|---|
+| `synapse_model.py` | The model (training definition) |
+| `download_pretrain_data/` | Notebooks that download the public pretraining corpora |
+| `tokenize/` | Tokenizer training pipeline (see its README) |
+| `pretrain/` | Pretraining: `train.py`, Colab notebook, VM bootstrap (`README_LAMBDA.md`) |
+| `sft/` | **The SFT pipeline** — data builders/generators, tokenization, training, tool runtime & loop, tool eval (see `sft/README.md`) |
+| `sparky/` | **Serving & evaluation** — chatbot (web UI, tools, voice), inference model, chat bench, leaderboard harness (see `sparky/README.md`) |
+| `tests/` | Unit tests (run with `python -m unittest discover tests`) — data builders, tokenization round-trips, the tool loop against the real tokenizer & sandbox |
 
-| Path                                | Why excluded                                                  |
-| ----------------------------------- | ------------------------------------------------------------- |
-| `.env`                              | API keys (OpenRouter, DeepSeek, Zhipu, Inception)             |
-| `synapse/`                          | Local Python 3.12 virtualenv                                  |
-| `.claude/`                          | Local AI tooling config                                       |
-| `AGENTS.md`                         | Internal agent notes                                          |
-| `common_pretrain_text_processing/`  | Shared text-cleaning + LLM-client utilities (private for now) |
-| `download_pretrain_books/`          | Gutenberg / FadedPage / PDF book download + clean pipeline (large text outputs) |
-| `download_pretrain_others/`         | Synthetic data generators (large generated corpora)           |
+Not in the repo (see `.gitignore`): secrets (`.env`), the local venv (`synapse/`),
+bulk corpora and generated datasets, model checkpoints, and a few private
+data-generation pipelines (`download_pretrain_books/`, `download_pretrain_others/`,
+`common_pretrain_text_processing/`). Data and checkpoints live in a Google Drive
+layout under `gdrive:synapse/` (datasets, tokenized data, manifests, and versioned
+checkpoint archives `sft_checkpoints/v{1,2,3}_*/`, each with a `MODEL_CARD.md`).
 
-> **Heads-up:** some scripts in this repo import from `common_pretrain_text_processing/`, which is **not** included. Anyone cloning the repo will need to either obtain that package separately or stub it out. The notebooks under `download_pretrain_data/` and `tokenize/` are mostly self-contained.
-
-## Pipeline overview
-
-The full pipeline (across both public and private parts) looks like this:
-
-```
-   ┌─────────────────────────┐    ┌─────────────────────────┐
-   │ download_pretrain_books │    │ download_pretrain_data  │  ← in GitHub
-   │  (Gutenberg, FadedPage, │    │  (C4, Wikipedia,        │
-   │   PDFs)        [private]│    │   RedPajama, code, ...) │
-   └────────────┬────────────┘    └────────────┬────────────┘
-                │                              │
-   ┌────────────▼────────────┐                 │
-   │ download_pretrain_others│                 │
-   │  (synthetic LLM corpora)│                 │
-   │                [private]│                 │
-   └────────────┬────────────┘                 │
-                │                              │
-                └──────────────┬───────────────┘
-                               │
-                  ┌────────────▼────────────┐
-                  │ tokenize/  ← in GitHub  │
-                  │ (BBPE, 64k vocab,       │
-                  │  uint16 shards)         │
-                  └────────────┬────────────┘
-                               │
-                  ┌────────────▼────────────┐
-                  │ pretrain/  ← in GitHub  │
-                  │ (training notebook)     │
-                  └─────────────────────────┘
-```
-
-## Setup
+## Quickstart
 
 ```bash
-python3.12 -m venv synapse
-source synapse/bin/activate
+python3.12 -m venv synapse && source synapse/bin/activate
 pip install -r requirements.txt
 ```
 
-Create a `.env` at the repo root with API keys (only needed for the data-generation pipelines, most of which live outside this repo):
+Secrets go in a gitignored `.env` at the repo root (`DEEPSEEK_API_KEY` for
+data-generation teachers and the eval judge, `BRAVE_API_KEY` for the search tool,
+`NGROK_AUTHTOKEN` for serving; others optional).
 
-```
-OPENROUTER_API_KEY=...
-DEEPSEEK_API_KEY=...
-ZHIPU_API=...
-INCEPTION_API=...
-```
+Most heavy steps run on a GPU box (Colab or a rented VM) against the Drive layout:
 
-`.env` is gitignored — never commit it.
+- **Pretrain**: `pretrain/pre_train_mar23.ipynb` (Colab) or `bash pretrain/run_on_vm.sh` (VM — `pretrain/README_LAMBDA.md`)
+- **SFT data prep + training**: `sft/sft_data_prep.ipynb`, then `sft/sft_pre_train.ipynb` — details in `sft/README.md`
+- **Chat with it**: `sparky/sparky_chatbot_colab.ipynb` — web UI via ngrok, tool calls rendered live, optional hands-free voice mode
+- **Evaluate**: `sparky/sft_bench_colab.ipynb` (49-question chat bench, LLM judge), `sparky/eval_tool_use_colab.ipynb` (4-leg tool-behavior eval incl. live search), `sparky/sparky_leaderboard_colab.ipynb` (Open LLM Leaderboard v1 suite)
 
-## What's in each included folder
+## Design principles
 
-### `download_pretrain_data/`
-
-Jupyter notebooks that pull public pretraining datasets:
-
-- `download_c4.ipynb` — Common Crawl C4
-- `download_wikipedia.ipynb` — Wikipedia
-- `download_redpajama.ipynb` — RedPajama
-- `download_code.ipynb` — code corpora
-- `download_finemath.ipynb` — math
-- `download_reasoning.ipynb` — reasoning traces
-
-Each notebook is meant to be run standalone — they typically download into a path on Google Drive (consistent with the `tokenize/` step below).
-
-### `tokenize/`
-
-- `tokenizer_pipeline.ipynb` — Google Colab notebook that mounts Drive at `/content/drive/MyDrive/synapse`, reads source data from `datasets_pretrain/data_*` directories, and trains a Byte-Level BPE tokenizer:
-  - vocab 64k
-  - 256 special tokens
-  - digit-per-token pre-tokenizer
-  - writes `uint16` shards plus a manifest back to Drive
-- `tokenizer_config.json` — saved tokenizer config
-
-### `pretrain/`
-
-- `train.py` — standalone training script. Reads tokenized shards from `$SYNAPSE_DIR/token_shards_merged/`, writes checkpoints to `$SYNAPSE_DIR/checkpoints/`. Configurable via env vars (see top of file).
-- `pre_train_mar23.ipynb` — Colab notebook shim that mounts Drive, downloads `train.py` from this repo, and runs it.
-- `run_on_vm.sh` — bash bootstrap for running training on a bare GPU VM (Lambda Labs, RunPod, etc.). See *Running pretraining* below.
-- `inspect_shards.ipynb` — utility for tracing which `.txt` source files are inside any given merged shard.
-- `recover_from_tar.py` — extract missing merged shards from the cold-backup tar on Drive (used if `token_shards_merged/` gets corrupted).
-
-## Running pretraining
-
-Two supported paths. Pick one.
-
-### A) Google Colab (Pro / Pro+)
-
-1. Open `pretrain/pre_train_mar23.ipynb` in Colab.
-2. Connect to a GPU runtime (A100 or "G4" / RTX PRO 6000 Blackwell recommended).
-3. Run all cells. The notebook mounts Drive, downloads the latest `train.py` from this repo, stages selected shards to `/content/shards`, and trains.
-4. Checkpoints save to `gdrive:synapse/checkpoints/` via the Drive mount. Run resumes automatically across Colab sessions (just re-run the notebook).
-
-Knobs (warmup, learning rate, batch size, checkpoint cadence) all live near the top of `pretrain/train.py`.
-
-### B) Lambda Labs / RunPod (or any bare GPU VM)
-
-One-time setup on a fresh box:
-
-```bash
-git clone https://github.com/ajencinas/synapse.git
-cd synapse
-pip install -r requirements.txt
-pip install torch numpy tqdm                       # training deps
-curl https://rclone.org/install.sh | sudo bash     # if rclone not present
-rclone config                                       # set up "gdrive" remote
-```
-
-To start (or resume) training:
-
-```bash
-bash pretrain/run_on_vm.sh
-```
-
-What the script does:
-- Pulls shards from `gdrive:synapse/token_shards_merged/` to local SSD (one-time, ~30 min for 300 GB at typical VM bandwidth).
-- Pulls the latest checkpoint and manifest from Drive if they exist (resume).
-- Sets `SYNAPSE_DIR`, `SKIP_STAGE=1`, `CHECKPOINT_PUSH_REMOTE=gdrive:synapse/checkpoints`.
-- Execs `python pretrain/train.py`.
-
-Each mid-epoch save (every 2 shards by default) is pushed back to Drive in a background thread via `rclone`, so you can destroy the VM at any time and resume on a new one.
-
-Override knobs (set as env vars before running the script):
-
-| Env var | Default | What it does |
-|---|---|---|
-| `LOCAL_DIR` | auto: `/home/ubuntu/synapse_data` (Lambda) or `/workspace/synapse_data` (RunPod) | Where shards land locally. |
-| `GDRIVE_REMOTE` | `gdrive` | Your rclone remote name. |
-| `GDRIVE_PATH` | `synapse` | Base path on Drive. |
-| `MAX_TOKENS` | (train.py default: 42 B) | Token budget. Set lower for smoke tests. |
-| `CHECKPOINT_NAME` | (train.py default) | Checkpoint filename. |
-| `SKIP_DATA_PULL` | unset | If `1`, skip the rclone shard copy (assume data is already local). |
-
-## Notes
-
-- No test framework, linter, or formatter is configured.
-- The Colab notebook assumes Drive; the VM path uses rclone-pushed Drive sync — both share the same `gdrive:synapse/...` layout.
-- If you need the private pipelines (`download_pretrain_books`, `download_pretrain_others`, `common_pretrain_text_processing`), reach out to the author.
+- **Train == inference, structurally.** One module (`sft/tools_runtime.py`) executes
+  tools at data-generation time and at serving time; one chat template
+  (`sparky/sparky_chat_template.py`) is byte-identical between the SFT encoder and
+  the chatbot; the eval drives the same loop the chatbot serves (`sft/tool_loop.py`).
+- **Verified data only.** Generated tool traces are kept only when the final answer
+  matches an independent gold answer; synthetic sources re-verify every record with
+  an independent checker; failed tool calls are never trained on.
+- **Leak-free splits.** Train/val is a global hash of the normalized question, so
+  the same question lands on the same side in every source and every re-tokenization.
+- **Fail loud.** Mismatched tokenizers, stale data, over-repeated sources, and
+  checkpoint key mismatches all abort with an explanation rather than train wrong.
+- **Nothing is lost.** Every model generation is archived on Drive with its
+  manifests, eval results, and a model card before the next one can overwrite it.
